@@ -1,0 +1,26 @@
+{
+  "name": "pi-btw",
+  "version": "0.1.0",
+  "description": "Ephemeral /btw side questions answered in a temporary overlay without polluting session history",
+  "type": "module",
+  "keywords": [
+    "pi-package"
+  ],
+  "files": [
+    "index.ts",
+    "btw.ts"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}

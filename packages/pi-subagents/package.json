@@ -1,0 +1,18 @@
+{
+  "name": "pi-subagents",
+  "version": "0.1.0",
+  "description": "Synchronous single-task delegation to isolated pi agents with explicit tool allowlists",
+  "type": "module",
+  "keywords": ["pi-package"],
+  "files": ["index.ts", "src", "README.md"],
+  "pi": {
+    "extensions": ["./index.ts"]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}
