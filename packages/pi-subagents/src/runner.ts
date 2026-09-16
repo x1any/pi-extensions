@@ -17,11 +17,14 @@ import {
 	type AgentSessionEvent,
 } from "@earendil-works/pi-coding-agent";
 import type { AgentConfig, ThinkingLevel } from "./agents.ts";
-import { isBuiltinToolName } from "./agents.ts";
+import { isBuiltinToolName, isReadOnlyAgent } from "./agents.ts";
 import { resolveAgentExtensions } from "./extensions.ts";
 
 const EXECUTION_TIMEOUT_MS = 10 * 60 * 1000;
 const ABORT_GRACE_MS = 5000;
+
+/** 父会话内只读子任务的并发上限：同一并行调用内的任务与模型并行发出的多个单任务调用共用这一个池。 */
+export const MAX_CONCURRENCY = 3;
 
 type FailureKind = "cancelled" | "timeout" | "startup" | "authentication" | "model"
 	| "protocol" | "no-answer" | "cleanup";
@@ -60,6 +63,13 @@ export interface RunResult {
 	fullOutputPath?: string;
 }
 
+/** 调度视图：并发上限、在跑数与排队数。展示层直接回填，不做推导。 */
+export interface ConcurrencyView {
+	limit: number;
+	active: number;
+	queued: number;
+}
+
 function errorText(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
@@ -91,12 +101,16 @@ function emit(request: RunRequest, state: RunState, lastTool?: string): void {
 	}
 }
 
-async function waitForSlot(slot: Promise<void>, signal: AbortSignal): Promise<void> {
+/**
+ * 等待调度器发槽。等待期间可取消，取消只释放自己的排队位置（由调用方的 finally 回收槽位），
+ * 不影响前面仍在执行的任务。
+ */
+async function waitForSlot(ready: Promise<void>, signal: AbortSignal): Promise<void> {
 	checkCancelled(signal);
 	let onAbort: () => void = () => {};
 	try {
 		await Promise.race([
-			slot,
+			ready,
 			new Promise<never>((_resolve, reject) => {
 				onAbort = () => reject(cancellation(signal));
 				signal.addEventListener("abort", onAbort, { once: true });
@@ -106,6 +120,78 @@ async function waitForSlot(slot: Promise<void>, signal: AbortSignal): Promise<vo
 		checkCancelled(signal);
 	} finally {
 		signal.removeEventListener("abort", onAbort);
+	}
+}
+
+/** 读任务共享并发槽；只读判定见 isReadOnlyAgent，未验证（可能写盘）的任务独占整个池。 */
+type SlotKind = "shared" | "exclusive";
+
+interface Waiter {
+	kind: SlotKind;
+	admitted: boolean;
+	grant: () => void;
+}
+
+/**
+ * 有界并发池：读任务最多 limit 个同时运行，未验证任务需要整个池空闲并立即独占。
+ *
+ * 持有者是 runner 单例，所以上限作用于父会话内的全部 subagent 调用，而不是某一个 tasks 数组。
+ * 队列严格 FIFO：排在独占任务后面的读任务也不会被放行，因此写任务不会饥饿。
+ */
+class SlotPool {
+	private readonly queue: Waiter[] = [];
+	private active = 0;
+	private exclusiveRunning = false;
+
+	constructor(private readonly limit: number) {}
+
+	get view(): ConcurrencyView {
+		return { limit: this.limit, active: this.active, queued: this.queue.length };
+	}
+
+	/**
+	 * 排队索取一个槽位。返回的 release 幂等：还在排队时表示取消排队，已获得槽位时表示释放槽位。
+	 * 因此调用方只需在 finally 里调用一次，取消和正常结束共用同一条回收路径。
+	 */
+	acquire(kind: SlotKind): { ready: Promise<void>; release: () => void } {
+		let grant!: () => void;
+		const ready = new Promise<void>((resolve) => { grant = resolve; });
+		const waiter: Waiter = { kind, admitted: false, grant };
+		this.queue.push(waiter);
+		this.pump();
+		return {
+			ready,
+			release: () => {
+				const position = this.queue.indexOf(waiter);
+				if (position >= 0) {
+					this.queue.splice(position, 1);
+					this.pump();
+					return;
+				}
+				// 不在队列里：要么已经发过槽位，要么之前已经释放过，只有前一种需要还给池子。
+				if (!waiter.admitted) return;
+				waiter.admitted = false;
+				this.active -= 1;
+				if (kind === "exclusive") this.exclusiveRunning = false;
+				this.pump();
+			},
+		};
+	}
+
+	/** 从队首逐个发放槽位；每次 release 或 acquire 都推进一次，FIFO 顺序与调用顺序一致。 */
+	private pump(): void {
+		while (this.queue.length > 0) {
+			const next = this.queue[0] as Waiter;
+			if (next.kind === "exclusive") {
+				// 独占需要整个池空闲：运行中的任务结束后会再 pump 一次。
+				if (this.exclusiveRunning || this.active > 0) return;
+				this.exclusiveRunning = true;
+			} else if (this.exclusiveRunning || this.active >= this.limit) return;
+			this.queue.shift();
+			next.admitted = true;
+			this.active += 1;
+			next.grant();
+		}
 	}
 }
 
@@ -352,28 +438,28 @@ async function runSession(request: RunRequest, signal: AbortSignal): Promise<{ t
 
 export class SubagentRunner {
 	private readonly lifetime = new AbortController();
-	private slot: Promise<void> = Promise.resolve();
+	private readonly pool = new SlotPool(MAX_CONCURRENCY);
 	private readonly calls = new Set<Promise<RunResult>>();
 	private readonly retainedDirs = new Set<string>();
 	private shutdownPromise?: Promise<void>;
 
+	/** 当前调度视图，供进度快照回填并发量。 */
+	get concurrency(): ConcurrencyView {
+		return this.pool.view;
+	}
+
 	run(request: RunRequest): Promise<RunResult> {
 		const signal = AbortSignal.any([this.lifetime.signal, ...(request.signal ? [request.signal] : [])]);
-		const previous = this.slot;
-		let release!: () => void;
-		const current = new Promise<void>((resolve) => { release = resolve; });
-		// 取消等待者只释放自己的位置，不能越过仍在执行的前一个任务。
-		this.slot = previous.then(() => current);
+		// 只读 Agent 共享并发槽；含写入或扩展工具时无法静态判断是否写盘，独占整个池。
+		const ticket = this.pool.acquire(isReadOnlyAgent(request.agent) ? "shared" : "exclusive");
 		const call = (async () => {
 			try {
 				emit(request, "waiting");
-				await waitForSlot(previous, signal);
+				await waitForSlot(ticket.ready, signal);
 				return await this.execute(request, signal);
-			} catch (error) {
-				if (error instanceof SubagentError && error.kind === "cleanup") this.lifetime.abort(error);
-				throw error;
 			} finally {
-				release();
+				// 排队时等于取消排队，已发槽位时等于释放；取消或失败都不能卡住其他任务。
+				ticket.release();
 			}
 		})();
 		this.calls.add(call);
@@ -399,22 +485,30 @@ export class SubagentRunner {
 
 	/** 只按需创建临时目录：没有截断就不留任何文件。 */
 	private async retainFullOutput(output: { text: string; lastTool?: string }, signal: AbortSignal): Promise<RunResult> {
+		const fullOutputPath = await this.retainFullText(output.text);
+		checkCancelled(signal);
+		const notice = `[结果已截断。完整回答：${fullOutputPath}；保留至父会话关闭、切换或 /reload。]\n\n`;
+		const preview = truncateHead(output.text, {
+			maxBytes: DEFAULT_MAX_BYTES - Buffer.byteLength(notice, "utf8"),
+			maxLines: DEFAULT_MAX_LINES - notice.split("\n").length,
+		});
+		return { text: notice + preview.content, lastTool: output.lastTool, truncated: true, fullOutputPath };
+	}
+
+	/**
+	 * 写入完整输出并返回路径。临时目录注册进 retainedDirs，由 shutdown 统一清理，
+	 * 因此取消、超时或父会话关闭都不会遗留文件。
+	 */
+	async retainFullText(text: string, fileName = "result.md"): Promise<string> {
 		let dir: string | undefined;
 		try {
 			dir = await mkdtemp(join(tmpdir(), "pi-subagents-"));
-			const fullOutputPath = join(dir, "result.md");
-			await writeFile(fullOutputPath, output.text, { encoding: "utf8", mode: 0o600 });
+			const path = join(dir, fileName);
+			await writeFile(path, text, { encoding: "utf8", mode: 0o600 });
 			this.retainedDirs.add(dir);
-			checkCancelled(signal);
-			const notice = `[结果已截断。完整回答：${fullOutputPath}；保留至父会话关闭、切换或 /reload。]\n\n`;
-			const preview = truncateHead(output.text, {
-				maxBytes: DEFAULT_MAX_BYTES - Buffer.byteLength(notice, "utf8"),
-				maxLines: DEFAULT_MAX_LINES - notice.split("\n").length,
-			});
-			return { text: notice + preview.content, lastTool: output.lastTool, truncated: true, fullOutputPath };
+			return path;
 		} catch (error) {
-			// 取消等已知失败保留临时目录，由 shutdown 统一清理。
-			if (error instanceof SubagentError) throw error;
+			// 写盘失败不影响调用结果，但目录已经建出来时不能留着。
 			if (dir) {
 				try {
 					await rm(dir, { recursive: true, force: true });
@@ -422,7 +516,7 @@ export class SubagentRunner {
 					this.retainedDirs.add(dir);
 				}
 			}
-			throw new SubagentError("cleanup", `无法保存完整回答：${errorText(error)}`);
+			throw new SubagentError("cleanup", `无法保存完整输出：${errorText(error)}`);
 		}
 	}
 

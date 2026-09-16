@@ -11,6 +11,29 @@ export type ThinkingLevel = NonNullable<ExtensionContext["thinkingLevel"]>;
 
 const READ_ONLY_TOOLS = ["read", "grep", "find", "ls"];
 const BUILTIN_TOOLS = new Set([...READ_ONLY_TOOLS, "edit", "write", "powershell", "bash"]);
+
+/**
+ * 已知只读的扩展工具：只读的含义是不改动工作目录。
+ *
+ * - pi-fff（`@ff-labs/pi-fff`）：`ffgrep`/`fffind`/`fff-multi-grep`；`override` 模式下第三个工具叫
+ *   `multi_grep`（`grep`/`find` 已被内置只读名单覆盖）。
+ * - pi-web-access：`web_search`/`source_check`/`fetch_content`/`get_search_content`（默认工具名）。
+ * - context7（`@upstash/context7-pi`）：`resolve-library-id`/`query-docs`（默认工具名，只查询远端文档）。
+ *
+ * pi-fff 与 pi-web-access 的写入都在扩展自己的状态目录与临时目录（pi-fff 的索引与 frecency/history 库，
+ * pi-web-access 的 web-search-cache、GitHub 克隆、PDF 产物），不在工作目录里，父会话用同一批工具时也在写；
+ * context7 只发远端查询，扩展内没有落盘代码。
+ * 这里只按工具名判定，不检查扩展实现；这些扩展都允许在配置里改工具名，改过名的工具不在名单里。
+ */
+const READ_ONLY_EXTENSION_TOOLS = [
+	// pi-fff
+	"ffgrep", "fffind", "fff-multi-grep", "multi_grep",
+	// pi-web-access（默认工具名）：网络搜索与抓取，不落盘到工作目录
+	"web_search", "source_check", "fetch_content", "get_search_content",
+	// context7（默认工具名）：远端文档查询，无本地写入
+	"resolve-library-id", "query-docs",
+];
+const READ_ONLY_TOOL_SET = new Set([...READ_ONLY_TOOLS, ...READ_ONLY_EXTENSION_TOOLS]);
 const THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 const FIELDS = new Set(["name", "description", "tools", "extensions", "model", "thinking"]);
 
@@ -29,6 +52,17 @@ export interface AgentConfig {
 
 export function isBuiltinToolName(name: string): boolean {
 	return BUILTIN_TOOLS.has(name);
+}
+
+/**
+ * 只读 Agent：工具白名单全部命中内置只读工具，或命中已知只读的扩展工具
+ * （pi-fff 搜索工具、pi-web-access 搜索/抓取工具）。
+ *
+ * 其余含 edit、write、powershell、bash 或名单外扩展工具名时无法静态判断是否写盘，一律视为未验证，
+ * 由调度器按独占处理。判定只影响调度，不拒绝调用，因此现有 Agent 定义无需修改。
+ */
+export function isReadOnlyAgent(agent: AgentConfig): boolean {
+	return agent.tools.every((tool) => READ_ONLY_TOOL_SET.has(tool));
 }
 
 export interface AgentDiscovery {
