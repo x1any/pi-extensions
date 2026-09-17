@@ -268,8 +268,8 @@ export default function (pi: ExtensionAPI): void {
 					hub.dispose();
 				}
 			},
-			renderCall(args, theme) {
-				return renderSubagentCall(args, theme);
+			renderCall(_args, theme) {
+				return renderSubagentCall(theme);
 			},
 			renderResult(result, options, theme, context) {
 				return renderSubagentResult(result, theme, {

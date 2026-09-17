@@ -63,11 +63,6 @@ function activeMark(state: RunState, theme: Theme, at: number): string {
  */
 const TRUNCATION_NOTICE = /^\[结果已截断[^\]]*\]\n*/gmu;
 
-/** 工具参数：唯一入口是 tasks 数组，属性全部按未知值防御。 */
-export interface SubagentCallArgs {
-	tasks?: unknown;
-}
-
 /** 工具结果：Pi 出错时会用空 details 覆盖部分结果，所以这里不假设 shape。 */
 export interface SubagentResult {
 	content: ReadonlyArray<{ type: string; text?: string }>;
@@ -110,23 +105,9 @@ export function formatProgressText(progress: CallProgress): string {
 	return parts.join("；");
 }
 
-/** 工具行标题：只给 Agent 名单（重复出现折叠成 ×n），单项与多项同一风格；任务内容一律不进调用行。 */
-export function renderSubagentCall(args: SubagentCallArgs | undefined, theme: Theme): Component {
-	return new Text(theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("accent", agentSummary(args?.tasks)), 0, 0);
-}
-
-/** 按输入顺序列出 Agent，同名折叠成 `名字 ×n`；参数流式到达时允许只有部分项。 */
-function agentSummary(tasks: unknown): string {
-	if (!Array.isArray(tasks) || tasks.length === 0) return "（未指定 Agent）";
-	const counts = new Map<string, number>();
-	for (const entry of tasks) {
-		const item = typeof entry === "object" && entry !== null && !Array.isArray(entry)
-			? (entry as { agent?: unknown }).agent
-			: undefined;
-		const name = agentName(item);
-		counts.set(name, (counts.get(name) ?? 0) + 1);
-	}
-	return [...counts].map(([name, count]) => (count > 1 ? `${name} ×${count}` : name)).join("、");
+/** 工具行标题：只给工具名，Agent 名单与任务内容都不进调用行。 */
+export function renderSubagentCall(theme: Theme): Component {
+	return new Text(theme.fg("toolTitle", theme.bold("subagent")), 0, 0);
 }
 
 /** 工具结果：details 可用时渲染任务列表，被 Pi 清空时（出错）退回纯文本。 */
@@ -300,10 +281,6 @@ function clipToWidth(text: string, maxWidth: number): string {
 	// 极窄宽度下省略号自己也要裁，否则会返回 3 列、超出 maxWidth。
 	if (maxWidth <= ELLIPSIS.length) return ELLIPSIS.slice(0, maxWidth);
 	return sliceByColumn(text, 0, maxWidth - ELLIPSIS.length, true) + ELLIPSIS;
-}
-
-function agentName(value: unknown): string {
-	return typeof value === "string" && value.trim() ? value.trim() : "（未指定 Agent）";
 }
 
 function stateLabel(state: RunState): string {
