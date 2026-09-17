@@ -9,7 +9,7 @@
  * https://github.com/jayshah5696/pi-agent-extensions/tree/main/extensions/btw
  */
 
-import { complete, type UserMessage } from "@earendil-works/pi-ai/compat";
+import { complete, type ProviderHeaders, type UserMessage } from "@earendil-works/pi-ai/compat";
 import type {
     ExtensionAPI,
     ExtensionCommandContext,
@@ -40,7 +40,7 @@ import {
 
 type RequestAuth = {
     apiKey?: string;
-    headers?: Record<string, string>;
+    headers?: ProviderHeaders;
 };
 
 type BtwQueryResult =
