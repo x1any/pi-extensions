@@ -9,7 +9,7 @@ import { Type } from "typebox";
 import { type AgentConfig, type AgentDiscovery, type ThinkingLevel, configurationHint, discoverAgents } from "./src/agents.ts";
 import { type ParallelProgress, ProgressHub, type TaskSink } from "./src/progress.ts";
 import { MAX_CONCURRENCY, type RunResult, type RunState, SubagentError, SubagentRunner } from "./src/runner.ts";
-import { clearRows, formatProgressText, publishRow, renderSubagentCall, renderSubagentResult, ticker } from "./src/ui.ts";
+import { formatProgressText, renderSubagentCall, renderSubagentResult, ticker } from "./src/ui.ts";
 
 /** 单次调用允许的任务数；与 runner 的并发上限对齐，超出直接报错而不是静默截断。 */
 const MAX_TASKS_PER_CALL = 4;
@@ -55,9 +55,6 @@ interface TaskOutcome {
 	result?: RunResult;
 	error?: unknown;
 }
-
-/** footer 汇总行的固定 key。 */
-const STATUS_KEY = "pi-subagents";
 
 function readableError(error: unknown): string {
 	const message = error instanceof Error ? error.message : String(error);
@@ -170,7 +167,6 @@ export default function (pi: ExtensionAPI): void {
 				const hub = new ProgressHub(
 					(progress) => {
 						onUpdate?.({ content: [{ type: "text", text: formatProgressText(progress) }], details: progress });
-						if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, publishRow(toolCallId, progress));
 					},
 					() => active.concurrency,
 				);
@@ -222,7 +218,7 @@ export default function (pi: ExtensionAPI): void {
 						return { task, state: "completed", result };
 					} catch (error) {
 						const state = failureState(error, signal);
-						// 失败走 sink：状态变化会立即刷新这一行与 footer。
+						// 失败走 sink：状态变化会立即刷新这一行。
 						task.sink({ state });
 						return { task, state, error };
 					}
@@ -256,7 +252,7 @@ export default function (pi: ExtensionAPI): void {
 
 				try {
 					for (const spec of taskSpecs(params)) {
-						// 先按输入顺序注册每个任务：校验或启动失败也能在对应行上收成终态，footer 不留残影。
+						// 先按输入顺序注册每个任务：校验或启动失败也能在对应行上收成终态。
 						const sink = hub.task(spec.index, spec.agentName);
 						sinks.push(sink);
 						const task = resolveTask(spec, sink);
@@ -265,7 +261,6 @@ export default function (pi: ExtensionAPI): void {
 					}
 					const outcomes = await Promise.all(tasks.map((task) => runTask(task)));
 					const details = hub.snapshot();
-					if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, publishRow(toolCallId, details));
 					const [only] = outcomes;
 					// 单任务模式与 v0.1 完全一致：结果就是最终回答文本，失败直接抛错。
 					if (tasks.length === 1 && only) {
@@ -277,10 +272,9 @@ export default function (pi: ExtensionAPI): void {
 					if (outcomes.every((outcome) => !outcome.result)) throw new Error(report);
 					return { content: [{ type: "text", text: await boundParallel(report, outcomes) }], details };
 				} catch (error) {
-					// Pi 出错时会丢弃 details，只把错误文本交给模型；这里保证每行收敛到终态、footer 不残留。
+					// Pi 出错时会丢弃 details，只把错误文本交给模型；这里保证每行收敛到终态。
 					const state = failureState(error, signal);
 					for (const sink of sinks) sink({ state });
-					if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, publishRow(toolCallId, hub.snapshot()));
 					throw new Error(readableError(error));
 				} finally {
 					hub.dispose();
@@ -300,8 +294,6 @@ export default function (pi: ExtensionAPI): void {
 
 	async function refresh(ctx: ExtensionContext): Promise<void> {
 		ticker.dispose();
-		clearRows();
-		if (ctx.hasUI) ctx.ui.setStatus(STATUS_KEY, undefined);
 		await runner.shutdown();
 		runner = new SubagentRunner();
 		discovery = undefined;
@@ -324,7 +316,6 @@ export default function (pi: ExtensionAPI): void {
 	pi.on("session_start", (_event, ctx) => refresh(ctx));
 	pi.on("session_shutdown", () => {
 		ticker.dispose();
-		clearRows();
 		return runner.shutdown();
 	});
 }

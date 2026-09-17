@@ -45,9 +45,6 @@ const TERMINAL_MARKS: Partial<Record<RunState, StateMark>> = {
 	cancelled: { glyph: "⊘", color: "muted", label: "已取消" },
 };
 
-/** footer 计数用静态标记：footer 不跟着帧刷新，放动画圈会像卡住。 */
-const COUNT_MARKS = { running: "◐", queued: "○", completed: "✓", failed: "✗" } as const;
-
 /** 动画圈取当前时间的帧，因此同一时刻所有行相位一致，也不需要额外状态。 */
 function spinnerFrame(at: number): string {
 	return SPINNER_FRAMES[Math.floor(at / SPINNER_MS) % SPINNER_FRAMES.length] as string;
@@ -160,44 +157,6 @@ export function renderSubagentResult(
 		tasks, text, theme,
 		expanded: options.expanded, isPartial: options.isPartial, isError: options.isError,
 	});
-}
-
-/** 还在推进的行（toolCallId → 最新快照），用于 footer 里跨行汇总。 */
-const liveRows = new Map<string, ParallelProgress>();
-
-/**
- * 登记/更新一行，并返回 footer 该显示的一行汇总；本行（或所有行）结束后返回 undefined。
- * 多行来自模型在一条消息里并行发起的多个 subagent 调用。
- */
-export function publishRow(toolCallId: string, progress: ParallelProgress): string | undefined {
-	if (progress.tasks.some((task) => !TERMINAL_STATES.has(task.state))) liveRows.set(toolCallId, progress);
-	else liveRows.delete(toolCallId);
-	return formatStatusText([...liveRows.values()]);
-}
-
-/** 会话结束或重载时清空跨行登记。 */
-export function clearRows(): void {
-	liveRows.clear();
-}
-
-/** footer 汇总：一行放完并发任务的计数与当前状态，无任务在推进时清空。 */
-function formatStatusText(rows: ParallelProgress[]): string | undefined {
-	const tasks = rows.flatMap((row) => row.tasks);
-	const active = tasks.filter((task) => !TERMINAL_STATES.has(task.state));
-	if (active.length === 0) return undefined;
-	const running = active.filter((task) => task.state !== "waiting").length;
-	const queued = active.length - running;
-	const completed = tasks.filter((task) => task.state === "completed").length;
-	const failed = tasks.filter((task) => TERMINAL_STATES.has(task.state) && task.state !== "completed").length;
-	const counts = [
-		running > 0 ? `${COUNT_MARKS.running}${running}` : "",
-		queued > 0 ? `${COUNT_MARKS.queued}${queued}` : "",
-		completed > 0 ? `${COUNT_MARKS.completed}${completed}` : "",
-		failed > 0 ? `${COUNT_MARKS.failed}${failed}` : "",
-	].filter(Boolean).join(" ");
-	const current = active[0];
-	const detail = `${current.agent} ${stateLabel(current.state)}${current.lastTool ? `（${current.lastTool}）` : ""}`;
-	return `subagents ${counts} · ${detail}`;
 }
 
 /** 耗时自己跳动：一行一个重绘回调，整次调用只跑一个定时器。 */
