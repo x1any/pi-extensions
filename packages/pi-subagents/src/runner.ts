@@ -71,13 +71,6 @@ export interface RunResult {
 	fullOutputPath?: string;
 }
 
-/** 调度视图：并发上限、在跑数与排队数。展示层直接回填，不做推导。 */
-export interface ConcurrencyView {
-	limit: number;
-	active: number;
-	queued: number;
-}
-
 function errorText(error: unknown): string {
 	return error instanceof Error ? error.message : String(error);
 }
@@ -152,10 +145,6 @@ class SlotPool {
 	private exclusiveRunning = false;
 
 	constructor(private readonly limit: number) {}
-
-	get view(): ConcurrencyView {
-		return { limit: this.limit, active: this.active, queued: this.queue.length };
-	}
 
 	/**
 	 * 排队索取一个槽位。返回的 release 幂等：还在排队时表示取消排队，已获得槽位时表示释放槽位。
@@ -480,11 +469,6 @@ export class SubagentRunner {
 	private readonly calls = new Set<Promise<RunResult>>();
 	private readonly retainedDirs = new Set<string>();
 	private shutdownPromise?: Promise<void>;
-
-	/** 当前调度视图，供进度快照回填并发量。 */
-	get concurrency(): ConcurrencyView {
-		return this.pool.view;
-	}
 
 	run(request: RunRequest): Promise<RunResult> {
 		const signal = AbortSignal.any([this.lifetime.signal, ...(request.signal ? [request.signal] : [])]);

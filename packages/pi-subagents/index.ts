@@ -165,12 +165,9 @@ export default function (pi: ExtensionAPI): void {
 			async execute(toolCallId, params, signal, onUpdate, ctx) {
 				// 整个调用固定用一个 runner：重载会换实例，在飞的调用不能被换掉。
 				const active = runner;
-				const hub = new ProgressHub(
-					(progress) => {
-						onUpdate?.({ content: [{ type: "text", text: formatProgressText(progress) }], details: progress });
-					},
-					() => active.concurrency,
-				);
+				const hub = new ProgressHub((progress) => {
+					onUpdate?.({ content: [{ type: "text", text: formatProgressText(progress) }], details: progress });
+				});
 				const tasks: PlannedTask[] = [];
 				const sinks: TaskSink[] = [];
 
@@ -257,7 +254,6 @@ export default function (pi: ExtensionAPI): void {
 						const sink = hub.task(spec.index, spec.agentName);
 						sinks.push(sink);
 						const task = resolveTask(spec, sink);
-						hub.describe(spec.index, { agent: task.agent.name, model: `${task.provider}/${task.modelId}` });
 						tasks.push(task);
 					}
 					const outcomes = await Promise.all(tasks.map((task) => runTask(task)));

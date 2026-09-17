@@ -1,21 +1,15 @@
 import { getMarkdownTheme, keyHint, type Theme, type ThemeColor } from "@earendil-works/pi-coding-agent";
 import { Markdown, Text, sliceByColumn, visibleWidth, type Component } from "@earendil-works/pi-tui";
-import type { ParallelProgress, TaskProgress, TaskUsage } from "./progress.ts";
+import type { ParallelProgress, TaskProgress } from "./progress.ts";
 import { TERMINAL_STATES } from "./progress.ts";
 import type { RunState } from "./runner.ts";
 
 /** 进行中的行统一用动画圈：状态词不进界面，避免堆砌状态。 */
 const SPINNER_MS = 120;
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-/** 展开态要重排 Markdown，放慢节拍，避免每 120ms 重解析整篇回答。 */
-const EXPANDED_TICK_MS = 1000;
 
-/** 折叠态最多显示的任务行数；超出时优先保留运行中的任务与最近完成的任务。 */
-const MAX_VISIBLE_TASKS = 4;
-/** 折叠态的答案预览行数。 */
-const PREVIEW_LINES = 3;
-/** renderCall 里任务预览的最大列宽：此时拿不到终端宽度，短终端交给 Text 自行换行。 */
-const CALL_PREVIEW_WIDTH = 80;
+/** details 缺失（出错被 Pi 清空）时的回退行数：与 Pi 自带 fallback 的 10 行保持一致。 */
+const FALLBACK_LINES = 10;
 /** 截断提示占 3 列，与 pi-tui 默认省略号等宽。 */
 const ELLIPSIS = "...";
 
@@ -116,27 +110,11 @@ export function formatProgressText(progress: ParallelProgress): string {
 	return parts.join("；");
 }
 
-/** 工具行标题：单任务显示 Agent 名与任务摘要；并行模式显示逐项摘要（有 tasks 时走这一支）。 */
+/** 工具行标题：单任务只给 Agent 名，并行只给任务数；任务内容一律不进调用行。 */
 export function renderSubagentCall(args: SubagentCallArgs | undefined, theme: Theme): Component {
-	const tasks = Array.isArray(args?.tasks) ? args.tasks : [];
-	if (tasks.length === 0) {
-		const agent = agentName(args?.agent);
-		const lines = [theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("accent", agent)];
-		const preview = previewLine(args?.task);
-		if (preview) lines.push(theme.fg("dim", `  ${preview}`));
-		return new Text(lines.join("\n"), 0, 0);
-	}
-	const lines = [theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("accent", `parallel ${tasks.length}`)];
-	tasks.slice(0, MAX_VISIBLE_TASKS).forEach((entry, position) => {
-		const item = entry as SubagentCallArgs | undefined;
-		const preview = previewLine(item?.task);
-		const line = theme.fg("muted", `  ${position + 1}. `) + theme.fg("accent", agentName(item?.agent));
-		lines.push(preview ? `${line}${theme.fg("dim", ` ${preview}`)}` : line);
-	});
-	if (tasks.length > MAX_VISIBLE_TASKS) {
-		lines.push(theme.fg("muted", `  ... 另有 ${tasks.length - MAX_VISIBLE_TASKS} 项`));
-	}
-	return new Text(lines.join("\n"), 0, 0);
+	const taskCount = Array.isArray(args?.tasks) ? args.tasks.length : 0;
+	const subject = taskCount > 0 ? `parallel ${taskCount}` : agentName(args?.agent);
+	return new Text(theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("accent", subject), 0, 0);
 }
 
 /** 工具结果：details 可用时渲染任务列表，被 Pi 清空时（出错）退回纯文本。 */
@@ -150,28 +128,40 @@ export function renderSubagentResult(
 	const tasks = Array.isArray(details?.tasks) ? details.tasks : [];
 	// 分片推进期间登记重绘节拍（动画圈 + 耗时靠自己跳动），终态渲染时注销。
 	if (options.isPartial && tasks.length > 0) {
-		ticker.watch(options.toolCallId, options.invalidate, options.expanded ? EXPANDED_TICK_MS : SPINNER_MS);
+		ticker.watch(options.toolCallId, options.invalidate);
 	} else ticker.unwatch(options.toolCallId);
 	if (tasks.length === 0) {
-		return new Text(options.isError ? theme.fg("error", text) : theme.fg("toolOutput", text), 0, 0);
+		return plainResult(text, options, theme);
 	}
 	return new TaskListComponent({
 		tasks, text, theme,
-		expanded: options.expanded, isPartial: options.isPartial, isError: options.isError,
+		expanded: options.expanded, isPartial: options.isPartial,
 	});
 }
 
-/** 耗时自己跳动：一行一个重绘回调，整次调用只跑一个定时器。 */
+/** details 被 Pi 清空时的回退（出错只有纯文本）：折叠态只给开头几行，超出的部分提示展开。 */
+function plainResult(text: string, options: SubagentResultOptions, theme: Theme): Component {
+	const color: ThemeColor = options.isError ? "error" : "toolOutput";
+	const lines = text.split("\n");
+	if (options.expanded || lines.length <= FALLBACK_LINES) {
+		return new Text(theme.fg(color, lines.join("\n")), 0, 0);
+	}
+	const hidden = lines.length - FALLBACK_LINES;
+	const body = lines.slice(0, FALLBACK_LINES).map((line) => theme.fg(color, line)).join("\n");
+	const hint = theme.fg("muted", `... 另有 ${hidden} 行 `)
+		+ keyHint("app.tools.expand", "查看完整内容");
+	return new Text(`${body}\n${hint}`, 0, 0);
+}
+
+/** 进行中的行靠时间自己跳动：整体只跑一个固定节拍的定时器。 */
 class Ticker {
 	private timer: ReturnType<typeof setInterval> | undefined;
-	private cadence = 0;
-	private readonly rows = new Map<string, { invalidate: () => void; intervalMs: number; due: number }>();
+	private readonly rows = new Map<string, () => void>();
 
-	/** intervalMs 由调用方定：折叠态跟动画圈走，展开态放慢。 */
-	watch(toolCallId: string, invalidate: () => void, intervalMs = SPINNER_MS): void {
+	watch(toolCallId: string, invalidate: () => void): void {
 		// 拿不到重绘句柄就不要走表，否则定时器只会白跑。
 		if (typeof invalidate !== "function") return;
-		this.rows.set(toolCallId, { invalidate, intervalMs, due: Date.now() + intervalMs });
+		this.rows.set(toolCallId, invalidate);
 		this.reschedule();
 	}
 
@@ -186,25 +176,22 @@ class Ticker {
 		this.reschedule();
 	}
 
-	/** 定时器按最小节拍跑，每行只在自己的间隔到期时重绘。 */
+	/** 只有一个节拍：有行就开表，没行就停表。 */
 	private reschedule(): void {
-		const cadence = this.rows.size === 0 ? 0 : Math.min(...[...this.rows.values()].map((row) => row.intervalMs));
-		if (cadence === this.cadence) return;
-		this.stop();
-		if (cadence === 0) return;
-		this.cadence = cadence;
-		const timer = setInterval(() => this.tick(), cadence);
+		if (this.rows.size === 0) {
+			this.stop();
+			return;
+		}
+		if (this.timer) return;
+		const timer = setInterval(() => this.tick(), SPINNER_MS);
 		(timer as { unref?: () => void }).unref?.();
 		this.timer = timer;
 	}
 
 	private tick(): void {
-		const now = Date.now();
-		for (const row of [...this.rows.values()]) {
-			if (row.due > now) continue;
-			row.due = now + row.intervalMs;
+		for (const invalidate of [...this.rows.values()]) {
 			try {
-				row.invalidate();
+				invalidate();
 			} catch {
 				// 行已销毁：下一次 unwatch 或 dispose 会清掉它。
 			}
@@ -214,7 +201,6 @@ class Ticker {
 	private stop(): void {
 		if (this.timer) clearInterval(this.timer);
 		this.timer = undefined;
-		this.cadence = 0;
 	}
 }
 
@@ -226,123 +212,67 @@ interface TaskListOptions {
 	text: string;
 	expanded: boolean;
 	isPartial: boolean;
-	isError: boolean;
 	theme: Theme;
 }
 
 /**
- * 结果视图：折叠态每个任务一行状态（单任务再给几行答案预览），展开态追加逐任务明细与完整回答。
+ * 结果视图：单任务与并行走同一形态——执行中只给状态行，完成后折叠态追加展开提示，展开态追加任务明细与完整回答。
  *
  * 布局只取决于 tasks.length，不依赖并发上限、调度策略或任务数量，因此并行落地时无需改动。
  */
 class TaskListComponent implements Component {
-	private lines: string[] | undefined;
-	private width = -1;
-
 	constructor(private readonly options: TaskListOptions) {}
 
 	render(width: number): string[] {
-		if (this.lines && this.width === width) return this.lines;
-		this.width = width;
-		this.lines = buildLines(this.options, width);
-		return this.lines;
+		return buildLines(this.options, width);
 	}
 
-	invalidate(): void {
-		this.lines = undefined;
-		this.width = -1;
-	}
+	/** Pi 每次无效化都会重建渲染组件，这里没有需要失效的缓存。 */
+	invalidate(): void {}
 }
 
 function buildLines(options: TaskListOptions, width: number): string[] {
-	const { tasks, text, expanded, isPartial, isError, theme } = options;
+	const { tasks, text, expanded, isPartial, theme } = options;
 	const multi = tasks.length > 1;
+	// 明细只在完成后生效：执行期间按展开键也只给状态，进度文本不是回答，不该被当成结果铺开。
+	const detail = expanded && !isPartial;
 	// 一次渲染固定一帧，同一行里所有任务用同一个动画相位。
 	const at = Date.now();
 	const lines: string[] = [];
-	if (multi) lines.push(summaryLine(tasks, theme, isError, at));
-	const { shown, hidden } = selectTasks(tasks, expanded ? tasks.length : MAX_VISIBLE_TASKS);
-	for (const task of shown) {
-		lines.push(...taskLines(task, theme, multi, expanded, at).map((line) => clipToWidth(line, width)));
+	for (const task of tasks) {
+		lines.push(...taskLines(task, theme, multi, detail, at).map((line) => clipToWidth(line, width)));
 	}
-	if (hidden > 0) lines.push(theme.fg("muted", `  ... 另有 ${hidden} 项`));
-	// 执行期间的 content 就是那行进度文本，不能当回答预览，也不能提示展开。
+	// 执行期间的 content 就是那行进度文本：只给状态，不追加明细或提示（detail 已为假）。
 	if (isPartial) return lines;
 	// 单任务截断时，提示文字已在上面用结构化形式给出，正文里不再重复一遍。
 	const body = (tasks.length === 1 && tasks[0]?.truncated ? text.replace(TRUNCATION_NOTICE, "") : text).trim();
-	if (expanded) {
+	if (detail) {
 		if (body) lines.push("", ...new Markdown(body, 0, 0, getMarkdownTheme()).render(width));
 		return lines;
 	}
-	// 并行模式的结果文本是逐任务报告的拼接，折叠态只给状态与展开提示，不再截取预览。
-	if (!multi) lines.push(...previewLines(text, tasks[0]?.truncated === true, theme, width));
-	if (body) lines.push(keyHint("app.tools.expand", multi ? "展开任务与回答" : "查看完整回答"));
+	// 折叠态一律只给状态与展开提示：单任务也不再截取回答预览，两种模式保持同一形态。
+	if (body) lines.push(keyHint("app.tools.expand", "展开完整回答"));
 	return lines;
 }
 
-function summaryLine(tasks: TaskProgress[], theme: Theme, isError: boolean, at: number): string {
-	const finished = tasks.filter((task) => TERMINAL_STATES.has(task.state)).length;
-	const failed = tasks.filter((task) => task.state === "failed" || task.state === "timed_out").length;
-	const active = tasks.find((task) => !TERMINAL_STATES.has(task.state));
-	const glyph = failed > 0 || isError ? theme.fg("error", "✗")
-		: finished === tasks.length ? theme.fg("success", "✓")
-		: activeMark(active?.state ?? "running", theme, at);
-	const parts = [failed > 0 ? `${finished}/${tasks.length} 结束` : `${finished}/${tasks.length} 完成`];
-	if (failed > 0) parts.push(`${failed} 项失败`);
-	const total = totalElapsed(tasks);
-	if (total) parts.push(`总用时 ${total}`);
-	return `${glyph} ${theme.fg("toolTitle", `parallel ${tasks.length}`)} ${theme.fg("muted", "·")} ${theme.fg("muted", parts.join(" · "))}`;
-}
-
-/** 折叠态挑选任务：运行中的全部保留，剩余名额给最近完成的任务。 */
-function selectTasks(tasks: TaskProgress[], limit: number): { shown: TaskProgress[]; hidden: number } {
-	if (tasks.length <= limit) return { shown: tasks, hidden: 0 };
-	const active = tasks.filter((task) => !TERMINAL_STATES.has(task.state));
-	const finished = tasks
-		.filter((task) => TERMINAL_STATES.has(task.state))
-		.sort((left, right) => (right.endedAt ?? 0) - (left.endedAt ?? 0));
-	const budget = Math.max(limit - active.length, 1);
-	const keep = new Set([...active, ...finished.slice(0, budget)].map((task) => task.index));
-	const shown = tasks.filter((task) => keep.has(task.index));
-	return { shown, hidden: tasks.length - shown.length };
-}
-
-function taskLines(task: TaskProgress, theme: Theme, multi: boolean, expanded: boolean, at: number): string[] {
+function taskLines(task: TaskProgress, theme: Theme, multi: boolean, detail: boolean, at: number): string[] {
 	const terminal = TERMINAL_MARKS[task.state];
 	const parts = [terminal ? theme.fg(terminal.color, terminal.glyph) : activeMark(task.state, theme, at)];
 	const label = `${multi ? `#${task.index} ` : ""}${task.agent}`;
-	parts.push(expanded && task.model ? `${theme.fg("toolTitle", label)} ${theme.fg("dim", `(${task.model})`)}` : theme.fg("toolTitle", label));
+	parts.push(theme.fg("toolTitle", label));
 	// 进行中不写状态词，只有终态需要说明原因（失败/已超时/已取消）。
 	if (terminal?.label) parts.push(theme.fg("muted", "·"), theme.fg(terminal.color, terminal.label));
-	if (!expanded && task.lastTool) parts.push(theme.fg("muted", `· ${task.lastTool}`));
+	if (task.lastTool) parts.push(theme.fg("muted", `· ${task.lastTool}`));
 	const elapsed = elapsedText(task);
 	if (elapsed) parts.push(theme.fg("dim", `· ${elapsed}`));
-	const usage = task.usage ? formatUsage(task.usage) : undefined;
-	if (usage) parts.push(theme.fg("dim", `· ${usage}`));
-	if (task.truncated && !expanded) parts.push(theme.fg("warning", "· 结果已截断"));
+	if (task.truncated && !detail) parts.push(theme.fg("warning", "· 结果已截断"));
 	const lines = [parts.join(" ")];
-	if (!expanded) return lines;
-	const trail = task.toolCalls
-		?.filter((call) => call.count > 0)
-		.map((call) => (call.count > 1 ? `${call.name} ×${call.count}` : call.name))
-		.join(" · ");
-	if (trail) lines.push(theme.fg("muted", `  → ${trail}`));
+	if (!detail) return lines;
 	if (task.truncated) {
 		lines.push(theme.fg("warning", "  [结果已截断]"));
 		if (task.fullOutputPath) lines.push(theme.fg("dim", `  完整结果：${task.fullOutputPath}`));
 	}
 	return lines;
-}
-
-/** 折叠态答案预览：去掉空行，只取开头几行，逐行按终端宽度截断。 */
-function previewLines(text: string, truncated: boolean, theme: Theme, width: number): string[] {
-	const body = truncated ? text.replace(TRUNCATION_NOTICE, "") : text;
-	return body
-		.split("\n")
-		.map((line) => line.trimEnd())
-		.filter((line) => line.length > 0)
-		.slice(0, PREVIEW_LINES)
-		.map((line) => theme.fg("toolOutput", clipToWidth(line, width)));
 }
 
 /**
@@ -364,12 +294,6 @@ function agentName(value: unknown): string {
 	return typeof value === "string" && value.trim() ? value.trim() : "（未指定 Agent）";
 }
 
-function previewLine(value: unknown): string | undefined {
-	if (typeof value !== "string") return undefined;
-	const collapsed = value.replace(/\s+/gu, " ").trim();
-	return collapsed ? clipToWidth(collapsed, CALL_PREVIEW_WIDTH) : undefined;
-}
-
 function stateLabel(state: RunState): string {
 	return STATE_LABELS[state] ?? state;
 }
@@ -379,34 +303,11 @@ function elapsedText(task: TaskProgress): string | undefined {
 	return formatDuration((task.endedAt ?? Date.now()) - task.startedAt);
 }
 
-/** 整次调用耗时：最早开始到最晚结束，仍在运行的任务算到当前时刻。 */
-function totalElapsed(tasks: TaskProgress[]): string | undefined {
-	const starts = tasks.map((task) => task.startedAt).filter((value): value is number => value !== undefined);
-	if (starts.length === 0) return undefined;
-	const ends = tasks.map((task) => task.endedAt ?? Date.now());
-	return formatDuration(Math.max(...ends) - Math.min(...starts));
-}
-
 function formatDuration(ms: number): string {
 	const seconds = Math.max(0, Math.round(ms / 1000));
 	const minutes = Math.floor(seconds / 60);
 	if (minutes < 60) return `${String(minutes).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
 	return `${Math.floor(minutes / 60)}h${String(minutes % 60).padStart(2, "0")}m`;
-}
-
-function formatUsage(usage: TaskUsage): string | undefined {
-	const parts: string[] = [];
-	if (usage.input) parts.push(`↑${formatTokens(usage.input)}`);
-	if (usage.output) parts.push(`↓${formatTokens(usage.output)}`);
-	if (usage.cacheRead) parts.push(`R${formatTokens(usage.cacheRead)}`);
-	if (usage.costTotal) parts.push(`$${usage.costTotal.toFixed(4)}`);
-	return parts.length ? parts.join(" ") : undefined;
-}
-
-function formatTokens(count: number): string {
-	if (count < 1000) return String(count);
-	if (count < 1_000_000) return `${(count / 1000).toFixed(count < 10_000 ? 1 : 0)}k`;
-	return `${(count / 1_000_000).toFixed(1)}M`;
 }
 
 function textOf(content: ReadonlyArray<{ type: string; text?: string }>): string {

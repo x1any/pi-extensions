@@ -1,4 +1,4 @@
-import type { ConcurrencyView, RunProgress, RunState } from "./runner.ts";
+import type { RunProgress, RunState } from "./runner.ts";
 
 /** 终态：任务不会再有新进度；渲染层与进度合并共用这一份定义。 */
 export const TERMINAL_STATES: ReadonlySet<RunState> = new Set<RunState>([
@@ -11,34 +11,20 @@ export const TERMINAL_STATES: ReadonlySet<RunState> = new Set<RunState>([
 /** 非状态变化的合并窗口：并行时 N 个任务的高频事件只触发一次重绘。 */
 const COALESCE_MS = 200;
 
-/** 单任务累计用量；由 runner 采集后填入，展示层只读不推导。 */
-export interface TaskUsage {
-	input: number;
-	output: number;
-	cacheRead: number;
-	cacheWrite: number;
-	costTotal: number;
-}
-
 /** 单任务状态。index 是唯一的稳定排序键，乱序完成时展示顺序也不变。 */
 export interface TaskProgress {
 	index: number;
 	agent: string;
-	model?: string;
 	state: RunState;
 	lastTool?: string;
-	toolCalls?: Array<{ name: string; count: number }>;
 	startedAt?: number;
 	endedAt?: number;
-	usage?: TaskUsage;
 	truncated?: boolean;
 	fullOutputPath?: string;
 }
 
 /** 一次工具调用的完整进度快照：单任务即 tasks.length === 1，并行即 N 个任务。 */
 export interface ParallelProgress {
-	mode: "single" | "parallel";
-	concurrency?: ConcurrencyView;
 	tasks: TaskProgress[];
 }
 
@@ -58,50 +44,32 @@ export class ProgressHub {
 	private disposed = false;
 
 	/** flush 只做展示（onUpdate），内部吞掉异常，不得影响子任务执行。 */
-	constructor(
-		private readonly flush: (progress: ParallelProgress) => void,
-		/** 调度视图来源：生成快照时读一次。并行时由 runner 单例给出全局并发量。 */
-		private readonly concurrency?: () => ConcurrencyView,
-	) {}
+	constructor(private readonly flush: (progress: ParallelProgress) => void) {}
 
 	/** 注册任务并返回它的进度汇入点；同一 index 重复注册会重置该任务状态。 */
 	task(index: number, agent: string): TaskSink {
-		this.tasks.set(index, { index, agent, state: "waiting", toolCalls: [] });
+		this.tasks.set(index, { index, agent, state: "waiting" });
 		return (progress) => {
 			this.update(index, progress);
 		};
 	}
 
-	/** 解析出 Agent 与模型后回填展示信息。 */
-	describe(index: number, patch: { agent?: string; model?: string }): void {
-		const task = this.tasks.get(index);
-		if (!task) return;
-		if (patch.agent) task.agent = patch.agent;
-		if (patch.model) task.model = patch.model;
-	}
-
-	/** 写入终态附加信息（截断、临时文件路径），返回最终 details 快照。 */
-	complete(index: number, patch: Partial<TaskProgress>): ParallelProgress {
+	/** 写入终态附加信息（截断、临时文件路径）。 */
+	complete(index: number, patch: Partial<TaskProgress>): void {
 		const task = this.tasks.get(index);
 		if (task) {
 			Object.assign(task, patch);
 			// 终态必须冻结耗时：否则后续重绘（缩放、展开）会让已结束任务的耗时继续增长。
 			if (TERMINAL_STATES.has(task.state) && task.endedAt === undefined) task.endedAt = Date.now();
 		}
-		return this.snapshot();
 	}
 
-	/** 当前 details 快照：tasks 按 index 升序，与事件到达顺序无关；并发量现读现填。 */
+	/** 当前 details 快照：tasks 按 index 升序，与事件到达顺序无关。 */
 	snapshot(): ParallelProgress {
 		const tasks = [...this.tasks.values()]
 			.sort((left, right) => left.index - right.index)
-			.map((task) => ({ ...task, toolCalls: task.toolCalls?.map((call) => ({ ...call })) }));
-		const concurrency = this.concurrency?.();
-		return {
-			mode: tasks.length > 1 ? "parallel" : "single",
-			...(concurrency ? { concurrency } : {}),
-			tasks,
-		};
+			.map((task) => ({ ...task }));
+		return { tasks };
 	}
 
 	dispose(): void {
@@ -116,11 +84,7 @@ export class ProgressHub {
 		const stateChanged = task.state !== progress.state;
 		task.state = progress.state;
 		const toolChanged = progress.lastTool !== undefined && progress.lastTool !== task.lastTool;
-		if (progress.lastTool !== undefined) {
-			task.lastTool = progress.lastTool;
-			// 只在真正开始一次工具调用时累计轨迹：后续事件会重复带上同一个工具名。
-			if (progress.state === "tool") this.countTool(task, progress.lastTool);
-		}
+		if (progress.lastTool !== undefined) task.lastTool = progress.lastTool;
 		// 排队不计入耗时：只有真正开始执行过的任务才记起点，排队中就被取消或失败的任务没有耗时。
 		if (task.startedAt === undefined && progress.state !== "waiting" && !TERMINAL_STATES.has(progress.state)) {
 			task.startedAt = Date.now();
@@ -129,13 +93,6 @@ export class ProgressHub {
 		if (stateChanged) this.flushNow();
 		else if (toolChanged) this.scheduleFlush();
 		// 状态与工具名都没变的重复事件不重绘。
-	}
-
-	private countTool(task: TaskProgress, name: string): void {
-		const calls = task.toolCalls ?? (task.toolCalls = []);
-		const last = calls[calls.length - 1];
-		if (last && last.name === name) last.count += 1;
-		else calls.push({ name, count: 1 });
 	}
 
 	/** 立即刷新并返回同一份快照。 */
