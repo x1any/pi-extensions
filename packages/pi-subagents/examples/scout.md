@@ -2,6 +2,7 @@
 name: scout
 description: 只读代码侦察代理，负责定位相关代码、调用链、已有模式和修改风险。
 tools: read, ls, grep, find
+extensions: npm:@ff-labs/pi-fff
 model: deepseek/deepseek-flash
 thinking: low
 ---

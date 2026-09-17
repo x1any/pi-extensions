@@ -2,6 +2,7 @@
 name: reviewer
 description: 只读评审代理，审查代码改动、方案与代码库现状，输出证据化问题清单与合入判断。
 tools: read, ls, grep, find
+extensions: npm:@ff-labs/pi-fff
 model: deepseek/deepseek-flash
 thinking: low
 ---

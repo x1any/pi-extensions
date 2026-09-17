@@ -28,7 +28,7 @@ tools: read, grep, find, ls
 | `name` | 必填，调用时使用准确名称 |
 | `description` | 必填，列入工具描述 |
 | `tools` | 工具白名单，逗号分隔字符串或 YAML 列表；省略为 `read, grep, find, ls` 加已声明可信只读来源的只读工具，`[]` 禁用全部。内置为 `read`/`grep`/`find`/`ls`/`edit`/`write`/`powershell`/`bash`，其余视为扩展工具；显式写出的名字必须真实注册，缺一个就拒绝启动，自动启用的名字缺失时忽略 |
-| `extensions` | 可选，只在本子会话加载的扩展来源（本地路径或已安装来源，如 `npm:pi-web-access`）；省略或 `[]` 为不加载，来源未安装或不可用时拒绝启动。不会安装或下载任何东西；来源随包提供的 skills 会一并加载 |
+| `extensions` | 可选，只在本子会话加载的扩展来源（本地路径或已安装来源，如 `npm:pi-web-access`）；省略或 `[]` 为不加载，来源未安装或不可用时拒绝启动。不会安装或下载任何东西；来源随包提供的 skills 会一并加载。声明 `npm:@ff-labs/pi-fff` 时，若 pi-fff 按全局 `pi-fff.json` 处于 `override` 模式，子会话的 `grep`/`find` 由 FFF 提供，不需要再列 `ffgrep`/`fffind` |
 | `model` | 可选，完整 `provider/model`，默认继承父会话当前模型 |
 | `thinking` | 可选，`off/minimal/low/medium/high/xhigh/max`，默认继承父会话 |
 
