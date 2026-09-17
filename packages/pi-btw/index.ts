@@ -9,7 +9,7 @@
  * https://github.com/jayshah5696/pi-agent-extensions/tree/main/extensions/btw
  */
 
-import { complete, type ProviderHeaders, type UserMessage } from "@earendil-works/pi-ai/compat";
+import type { Usage, UserMessage } from "@earendil-works/pi-ai/compat";
 import type {
     ExtensionAPI,
     ExtensionCommandContext,
@@ -19,7 +19,6 @@ import {
     BorderedLoader,
     buildSessionContext,
     convertToLlm,
-    serializeConversation,
 } from "@earendil-works/pi-coding-agent";
 import {
     type Component,
@@ -34,33 +33,28 @@ import {
 import {
     BTW_SYSTEM_PROMPT,
     buildBtwUserMessage,
-    validateBtwArgs,
     extractResponseText,
+    formatUsage,
+    resolveScrollState,
+    serializeBtwConversation,
+    validateBtwArgs,
 } from "./btw.js";
 
-type RequestAuth = {
-    apiKey?: string;
-    headers?: ProviderHeaders;
-};
-
 type BtwQueryResult =
-    | { status: "ok"; answer: string }
+    | { status: "ok"; answer: string; usage?: Usage }
     | { status: "cancelled" }
     | { status: "error"; message: string };
+
+/**
+ * Upper bound for a single /btw request. Providers that support it abort the
+ * underlying HTTP request; interactive cancel stays available regardless.
+ */
+const BTW_REQUEST_TIMEOUT_MS = 5 * 60_000;
 
 function errorMessage(error: unknown): string {
     if (error instanceof Error) return error.message;
     if (typeof error === "string") return error;
     return "Unknown error";
-}
-
-async function getRequestAuth(
-    ctx: ExtensionCommandContext,
-    model: NonNullable<ExtensionCommandContext["model"]>,
-): Promise<RequestAuth | undefined> {
-    const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-    if (!auth.ok) return undefined;
-    return { apiKey: auth.apiKey, headers: auth.headers };
 }
 
 async function queryBtwAnswer(
@@ -70,11 +64,13 @@ async function queryBtwAnswer(
     signal?: AbortSignal,
 ): Promise<BtwQueryResult> {
     try {
-        const requestAuth = await getRequestAuth(ctx, model);
-        const response = await complete(
+        // Route through the registry so auth (apiKey/headers/baseUrl/env) and
+        // provider request transforms match regular session calls, and auth
+        // failures surface as errors instead of silently falling back.
+        const response = await ctx.modelRegistry.complete(
             model,
             { systemPrompt: BTW_SYSTEM_PROMPT, messages: [userMessage] },
-            { ...requestAuth, signal },
+            { signal, timeoutMs: BTW_REQUEST_TIMEOUT_MS },
         );
 
         if (response.stopReason === "aborted") {
@@ -88,11 +84,46 @@ async function queryBtwAnswer(
             };
         }
 
-        return { status: "ok", answer: extractResponseText(response.content) };
+        return {
+            status: "ok",
+            answer: extractResponseText(response.content),
+            usage: response.usage,
+        };
     } catch (error) {
         if (signal?.aborted) return { status: "cancelled" };
         return { status: "error", message: errorMessage(error) };
     }
+}
+
+/**
+ * Overlay height cap in percent of the terminal height. Must stay in sync with
+ * the `maxHeight` passed to ctx.ui.custom below.
+ */
+const OVERLAY_MAX_HEIGHT_PERCENT = 92;
+const OVERLAY_MAX_HEIGHT = `${OVERLAY_MAX_HEIGHT_PERCENT}%`;
+/** Vertical overlay margin in rows, matched by the `margin` option below. */
+const OVERLAY_MARGIN_ROWS = 1;
+/**
+ * Rows the overlay spends on borders and headers/footer: top border, title,
+ * subtitle, separator, separator, footer, bottom border.
+ */
+const OVERLAY_CHROME_ROWS = 7;
+
+/**
+ * Rows the overlay may occupy, mirroring pi-tui's overlay layout: the percentage
+ * maxHeight clamped to the terminal height minus the vertical margins. pi-tui
+ * trims overlays from the bottom, so budgeting more rows than this would hide
+ * the footer and the tail of the answer.
+ */
+function overlayRowBudget(termRows: number): number {
+    const capped = Math.floor((termRows * OVERLAY_MAX_HEIGHT_PERCENT) / 100);
+    const available = Math.max(1, termRows - OVERLAY_MARGIN_ROWS * 2);
+    return Math.max(1, Math.min(capped, available));
+}
+
+/** Scrollable body rows the overlay can actually show. */
+function overlayBodyRowBudget(termRows: number): number {
+    return Math.max(1, overlayRowBudget(termRows) - OVERLAY_CHROME_ROWS);
 }
 
 /**
@@ -104,6 +135,7 @@ class BtwOverlay implements Component {
     private readonly theme: Theme;
     private readonly question: string;
     private readonly answer: string;
+    private readonly meta: string;
     private readonly onDone: () => void;
     private scrollOffset = 0;
     private cachedWidth?: number;
@@ -115,12 +147,14 @@ class BtwOverlay implements Component {
         theme: Theme,
         question: string,
         answer: string,
+        meta: string,
         onDone: () => void,
     ) {
         this.tui = tui;
         this.theme = theme;
         this.question = question;
         this.answer = answer;
+        this.meta = meta;
         this.onDone = onDone;
     }
 
@@ -135,7 +169,7 @@ class BtwOverlay implements Component {
             return;
         }
 
-        const pageStep = Math.max(4, (this.tui.terminal.rows ?? 24) - 8);
+        const pageStep = Math.max(1, overlayBodyRowBudget(this.tui.terminal.rows ?? 24) - 1);
 
         if (matchesKey(data, Key.up) || data === "k") {
             if (this.scrollOffset > 0) {
@@ -288,22 +322,23 @@ class BtwOverlay implements Component {
             "",
         );
 
-        const termHeight = this.tui.terminal.rows ?? 24;
-        const fixedLines = 7;
-        const maxVisibleBodyLines = Math.max(4, termHeight - fixedLines);
-        this.maxScrollOffset = Math.max(0, bodyLines.length - maxVisibleBodyLines);
-        if (this.scrollOffset > this.maxScrollOffset) {
-            this.scrollOffset = this.maxScrollOffset;
-        }
+        const visibleRows = overlayBodyRowBudget(this.tui.terminal.rows ?? 24);
+        const scroll = resolveScrollState(
+            this.scrollOffset,
+            bodyLines.length,
+            visibleRows,
+        );
+        this.maxScrollOffset = scroll.maxScrollOffset;
+        this.scrollOffset = scroll.scrollOffset;
 
         const visibleBodyLines = bodyLines.slice(
             this.scrollOffset,
-            this.scrollOffset + maxVisibleBodyLines,
+            this.scrollOffset + visibleRows,
         );
 
         const scrollCurrent = Math.min(
             bodyLines.length,
-            this.scrollOffset + maxVisibleBodyLines,
+            this.scrollOffset + visibleRows,
         );
         const scrollInfo =
             this.maxScrollOffset > 0
@@ -327,15 +362,7 @@ class BtwOverlay implements Component {
             ),
         );
         lines.push(
-            padToWidth(
-                boxLine(
-                    theme.fg(
-                        "dim",
-                        "An editorial-style reading pane for long prompts and answers.",
-                    ),
-                    2,
-                ),
-            ),
+            padToWidth(boxLine(theme.fg("dim", this.meta), 2)),
         );
         lines.push(
             padToWidth(theme.fg("accent", "├" + horizontalLine(boxWidth - 2) + "┤")),
@@ -387,11 +414,11 @@ async function runBtwCommand(
     ctx: ExtensionCommandContext,
 ): Promise<void> {
     const validation = validateBtwArgs(args);
-    if (!validation.valid) {
-        reportMessage(ctx, validation.error!, "error");
+    if (!validation.ok) {
+        reportMessage(ctx, validation.error, "error");
         return;
     }
-    const question = validation.question!;
+    const question = validation.question;
 
     if (!ctx.model) {
         reportMessage(ctx, "No model selected. Use /model to select a model first.", "error");
@@ -407,7 +434,7 @@ async function runBtwCommand(
     let conversationText = "";
     if (messages.length > 0) {
         const llmMessages = convertToLlm(messages);
-        conversationText = serializeConversation(llmMessages);
+        conversationText = serializeBtwConversation(llmMessages);
     }
 
     const btwModel = ctx.model;
@@ -464,17 +491,32 @@ async function runBtwCommand(
         return;
     }
 
+    const usageText = formatUsage(answerResult.usage);
+    const overlayMeta = usageText ? `${btwModel.id} · ${usageText}` : btwModel.id;
+
     await ctx.ui.custom<void>(
         (tui, theme, _kb, done) => {
-            return new BtwOverlay(tui, theme, question, answerResult.answer, done);
+            return new BtwOverlay(
+                tui,
+                theme,
+                question,
+                answerResult.answer,
+                overlayMeta,
+                done,
+            );
         },
         {
             overlay: true,
             overlayOptions: {
                 anchor: "center",
                 width: "92%",
-                maxHeight: "92%",
-                margin: { top: 1, bottom: 1, left: 1, right: 1 },
+                maxHeight: OVERLAY_MAX_HEIGHT,
+                margin: {
+                    top: OVERLAY_MARGIN_ROWS,
+                    bottom: OVERLAY_MARGIN_ROWS,
+                    left: 1,
+                    right: 1,
+                },
             },
         },
     );
