@@ -10,7 +10,7 @@ import { normalizeSource } from "./extensions.ts";
 
 export type ThinkingLevel = NonNullable<ExtensionContext["thinkingLevel"]>;
 
-export const READ_ONLY_TOOLS = ["read", "grep", "find", "ls"];
+const READ_ONLY_TOOLS = ["read", "grep", "find", "ls"];
 const BUILTIN_TOOLS = new Set([...READ_ONLY_TOOLS, "edit", "write", "powershell", "bash"]);
 
 /**
@@ -32,11 +32,11 @@ const BUILTIN_TOOLS = new Set([...READ_ONLY_TOOLS, "edit", "write", "powershell"
  * 「来源注册了同名工具才生效」处理。
  * 名单外的扩展工具无法静态判断是否写盘：既不会自动启用，也按未验证处理（独占调度）。
  */
-export const TRUSTED_READ_ONLY_SOURCES: Record<string, string[]> = {
+const TRUSTED_READ_ONLY_SOURCES: Record<string, string[]> = {
 	"pi-web-access": ["web_search", "source_check", "fetch_content", "get_search_content"],
 	"@upstash/context7-pi": ["resolve-library-id", "query-docs"],
 };
-export const READ_ONLY_EXTENSION_TOOLS = [...new Set(Object.values(TRUSTED_READ_ONLY_SOURCES).flat())];
+const READ_ONLY_EXTENSION_TOOLS = [...new Set(Object.values(TRUSTED_READ_ONLY_SOURCES).flat())];
 const READ_ONLY_TOOL_SET = new Set([...READ_ONLY_TOOLS, ...READ_ONLY_EXTENSION_TOOLS]);
 const THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 const FIELDS = new Set(["name", "description", "tools", "extensions", "model", "thinking"]);
@@ -209,6 +209,6 @@ export function configurationHint(cwd: string): string {
 	return [
 		`请在 ${join(getAgentDir(), "agents")} 或受信任项目的 ${join(cwd, CONFIG_DIR_NAME, "agents")} 中创建 Agent Markdown 文件，然后 /reload。`,
 		"必填 frontmatter 为 name、description；省略 tools 时启用 read, grep, find, ls，若声明了可信只读来源还包含该来源的只读工具。扩展不会自动创建配置。",
-		"扩展工具需要在 extensions 中声明已安装的扩展来源；省略 tools 时会自动包含该来源的只读工具（按来源实际注册情况生效），其余扩展工具需逐名列出。不会自动安装缺失的扩展。",
+		"子会话默认加载 pi-fff（缺失时跳过并回退内置 grep/find）；其他扩展工具需要在 extensions 中声明已安装的来源；省略 tools 时会自动包含该来源的只读工具（按来源实际注册情况生效），其余扩展工具需逐名列出。不会自动安装或下载缺失的扩展，来源不可用时跳过该来源继续。",
 	].join("");
 }

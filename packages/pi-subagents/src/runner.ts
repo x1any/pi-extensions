@@ -18,10 +18,18 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import type { AgentConfig, ThinkingLevel } from "./agents.ts";
 import { isBuiltinToolName, isReadOnlyAgent } from "./agents.ts";
-import { resolveAgentExtensions } from "./extensions.ts";
+import { resolveAgentExtensions, normalizeSource } from "./extensions.ts";
 
 const EXECUTION_TIMEOUT_MS = 10 * 60 * 1000;
 const ABORT_GRACE_MS = 5000;
+
+/**
+ * 默认在子会话里加载的扩展来源：Agent 不用在 frontmatter 里声明。
+ * 只放随 pi 提供检索/只读能力的来源；来源缺失（未安装、未启用）时静默跳过，子会话退回 Pi 内置工具
+ * （pi-fff 处于 `override` 模式时，它覆盖的就是内置名 `grep`/`find`，所以回退不需要换工具名）。
+ * 加载失败（来源存在但自身报错）仍然报错，不静默降级。
+ */
+const DEFAULT_CHILD_EXTENSIONS = ["npm:@ff-labs/pi-fff"];
 
 /** 父会话内只读子任务的并发上限：同一并行调用内的任务与模型并行发出的多个单任务调用共用这一个池。 */
 export const MAX_CONCURRENCY = 3;
@@ -206,10 +214,13 @@ interface FinalAnswer {
  * 在父进程内创建一个独立的 Pi 会话。
  *
  * 与旧版 spawn 一个 `pi --mode json --print` 子进程等价：全新上下文、无持久会话、不自动发现扩展与技能，
- * 只按 Agent 配置启用工具白名单、显式加载声明的扩展（含来源随包提供的 skills），并追加角色正文作为系统提示。
+ * 只按 Agent 配置启用工具白名单、默认加载 `npm:@ff-labs/pi-fff`（Agent 不用声明）、显式加载 Agent 声明的
+ * 扩展（含来源随包提供的 skills），并追加角色正文作为系统提示。
+ * 来源不可用（未安装、未启用或路径不存在）时跳过该来源，子会话用已注册的工具继续；只有显式写进 tools 的
+ * 名字缺失才拒绝启动。
  * 不复制父会话内存态的 provider、认证和扩展工具；这些仍由普通 Pi 配置在子运行时中解析。
  */
-async function createChildSession(request: RunRequest): Promise<AgentSession> {
+async function createChildSession(request: RunRequest): Promise<{ session: AgentSession; unavailableSources: string[] }> {
 	const agentDir = getAgentDir();
 	const settingsManager = SettingsManager.create(request.cwd, agentDir, { projectTrusted: request.projectTrusted });
 	let modelRuntime: ModelRuntime;
@@ -232,29 +243,27 @@ async function createChildSession(request: RunRequest): Promise<AgentSession> {
 	}
 	let extensionPaths: string[] = [];
 	let skillPaths: string[] = [];
-	if (request.agent.extensions.length > 0) {
-		let missing: string[] = [];
-		try {
-			const resolution = await resolveAgentExtensions(request.agent.extensions, {
-				cwd: request.cwd, agentDir, settingsManager,
-			});
-			extensionPaths = resolution.paths;
-			skillPaths = resolution.skillPaths;
-			missing = resolution.missing;
-		} catch (error) {
-			throw new SubagentError("startup", `无法解析 Agent 声明的扩展：${errorText(error)}`);
-		}
-		if (missing.length > 0) {
-			throw new SubagentError("startup", `Agent 声明的扩展不可用：[${missing.join(", ")}]。本扩展不会自动安装；请确认包来源已安装（写成 npm:xxx 或 git:xxx）、未被包过滤禁用，或改用已存在的本地路径。`);
-		}
+	// 默认来源在前、声明来源在后，同一来源只解析一次（Agent 重复声明 pi-fff 也不会加载两次）。
+	let unavailableSources: string[] = [];
+	try {
+		const resolution = await resolveAgentExtensions(mergeSources(request.agent.extensions), {
+			cwd: request.cwd, agentDir, settingsManager,
+		});
+		extensionPaths = resolution.paths;
+		skillPaths = resolution.skillPaths;
+		// 默认来源缺失属于正常回退（改用内置 grep/find），不写进结果文本；Agent 显式声明的才提示。
+		const defaults = new Set(DEFAULT_CHILD_EXTENSIONS.map((source) => normalizeSource(source)));
+		unavailableSources = resolution.missing.filter((source) => !defaults.has(normalizeSource(source)));
+	} catch (error) {
+		throw new SubagentError("startup", `无法解析子会话要加载的扩展：${errorText(error)}`);
 	}
 	const loader = new DefaultResourceLoader({
 		cwd: request.cwd,
 		agentDir,
 		settingsManager,
 		// 等价于旧版的 --no-extensions --no-skills --no-prompt-templates --no-themes：
-		// 不做环境发现，只加载 Agent 显式声明的扩展；也不会在同一进程里再加载一份本扩展。
-		// 声明来源随包提供的 skills 由 additionalSkillPaths 显式传入，不依赖全局发现。
+		// 不做环境发现，只加载默认来源与 Agent 声明的扩展；也不会在同一进程里再加载一份本扩展。
+		// 来源随包提供的 skills 由 additionalSkillPaths 显式传入，不依赖全局发现。
 		noExtensions: true,
 		noSkills: true,
 		noPromptTemplates: true,
@@ -294,8 +303,21 @@ async function createChildSession(request: RunRequest): Promise<AgentSession> {
 	}
 	// print 模式：没有交互式 UI，已加载的扩展只能走无界面路径。
 	await session.bindExtensions({ mode: "print" });
-	checkDeclaredTools(request, session);
-	return session;
+	checkDeclaredTools(request, session, unavailableSources);
+	return { session, unavailableSources };
+}
+
+/** 默认来源在前、声明来源在后；同一来源（忽略 `npm:` 前缀与版本号）只保留第一次出现。 */
+function mergeSources(declared: string[]): string[] {
+	const merged: string[] = [];
+	const seen = new Set<string>();
+	for (const source of [...DEFAULT_CHILD_EXTENSIONS, ...declared]) {
+		const key = normalizeSource(source);
+		if (seen.has(key)) continue;
+		seen.add(key);
+		merged.push(source);
+	}
+	return merged;
 }
 
 function isDeclaredExtensionPath(path: string, declared: string[]): boolean {
@@ -310,8 +332,9 @@ function isDeclaredExtensionPath(path: string, declared: string[]): boolean {
  * Pi 的工具白名单会静默忽略未注册的名字，所以在启动前对照子会话注册表校验。
  * 只校验 requiredTools（frontmatter 显式写出的名字）：省略 tools 时自动带上的扩展工具
  * 可能因功能开关或改名而不存在，那些名字由子会话静默忽略。
+ * 缺的是来源不可用（已跳过）造成的，就在提示里点名来源，避免误指到扩展自身的启用条件。
  */
-function checkDeclaredTools(request: RunRequest, session: AgentSession): void {
+function checkDeclaredTools(request: RunRequest, session: AgentSession, unavailableSources: string[]): void {
 	const provided = new Set(session.getAllTools().map((tool) => tool.name));
 	const missing = request.agent.requiredTools.filter((name) => !provided.has(name));
 	if (missing.length === 0) return;
@@ -319,16 +342,18 @@ function checkDeclaredTools(request: RunRequest, session: AgentSession): void {
 		.map((tool) => tool.definition.name)
 		.filter((name) => !isBuiltinToolName(name)))];
 	const hint = request.agent.extensions.length === 0
-		? "该 Agent 未声明 extensions；扩展工具需要在 tools 列出名字，并在 extensions 中声明已安装的来源。"
-		: fromExtensions.length > 0
-			? `已加载扩展注册的工具：[${fromExtensions.join(", ")}]。`
-			: "已声明的扩展没有注册任何工具，请检查扩展自身的启用条件。";
+		? "该 Agent 未声明 extensions（子会话只默认加载 pi-fff）；扩展工具需要在 tools 列出名字，并在 extensions 中声明已安装的来源。"
+		: unavailableSources.length > 0
+			? `已声明的扩展来源不可用：[${unavailableSources.join(", ")}]（未安装、未启用或路径不存在），因此没有注册任何工具。`
+			: fromExtensions.length > 0
+				? `已加载扩展注册的工具：[${fromExtensions.join(", ")}]。`
+				: "已声明的扩展没有注册任何工具，请检查扩展自身的启用条件。";
 	throw new SubagentError("startup", `子会话缺少 Agent 声明的工具：[${missing.join(", ")}]。${hint}`);
 }
 
 async function runSession(request: RunRequest, signal: AbortSignal): Promise<{ text: string; lastTool?: string }> {
 	checkCancelled(signal);
-	const session = await createChildSession(request);
+	const { session, unavailableSources } = await createChildSession(request);
 	checkCancelled(signal);
 
 	let answer: FinalAnswer | undefined;
@@ -441,7 +466,12 @@ async function runSession(request: RunRequest, signal: AbortSignal): Promise<{ t
 	if (!answer || answer.stopReason !== "stop" || answer.hasToolCalls || !answer.text.trim()) {
 		throw new SubagentError("no-answer", `子会话没有有效的最终文本回答（stopReason=${answer?.stopReason ?? "none"}）。\n${errors}`);
 	}
-	return { text: answer.text, lastTool };
+	// 跳过来源的事实要进入模型可见文本：主 Agent 需要知道这次委派少了哪些扩展工具，
+	// 而不是以为子会话的检索仍走 pi-fff。
+	const notice = unavailableSources.length > 0
+		? `[已跳过不可用的扩展来源：${unavailableSources.join(", ")}（未安装、未启用或路径不存在），子会话用已注册的工具继续。]`
+		: "";
+	return { text: notice ? `${notice}\n\n${answer.text}` : answer.text, lastTool };
 }
 
 export class SubagentRunner {

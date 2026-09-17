@@ -6,16 +6,13 @@ import {
 	truncateHead,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { type AgentConfig, type AgentDiscovery, type ThinkingLevel, configurationHint, discoverAgents, READ_ONLY_EXTENSION_TOOLS, READ_ONLY_TOOLS, TRUSTED_READ_ONLY_SOURCES } from "./src/agents.ts";
+import { type AgentConfig, type AgentDiscovery, type ThinkingLevel, configurationHint, discoverAgents } from "./src/agents.ts";
 import { type ParallelProgress, ProgressHub, type TaskSink } from "./src/progress.ts";
 import { MAX_CONCURRENCY, type RunResult, type RunState, SubagentError, SubagentRunner } from "./src/runner.ts";
 import { formatProgressText, renderSubagentCall, renderSubagentResult, ticker } from "./src/ui.ts";
 
 /** 单次调用允许的任务数；与 runner 的并发上限对齐，超出直接报错而不是静默截断。 */
 const MAX_TASKS_PER_CALL = 4;
-
-/** 工具描述里列出的可信只读来源，直接取自来源表，避免描述文本与实现漂移。 */
-const TRUSTED_SOURCE_NAMES = Object.keys(TRUSTED_READ_ONLY_SOURCES).join("、");
 
 /** 工具结果 details：与展示层共用的多任务进度快照，单任务模式即 tasks.length === 1。 */
 type SubagentDetails = ParallelProgress;
@@ -150,16 +147,17 @@ export default function (pi: ExtensionAPI): void {
 		pi.registerTool<typeof Parameters, SubagentDetails>({
 			name: "subagent",
 			label: "Subagent",
+			promptSnippet: "把自包含任务委派给独立上下文的子 Agent，只返回最终回答",
+			promptGuidelines: [
+				"subagent：委派前把任务写完整（背景、相关路径或符号、约束、期望输出），子 Agent 看不到本会话历史。",
+				`subagent：互相独立的只读调查用 tasks 一次提交（最多 ${MAX_TASKS_PER_CALL} 项）；需要来回确认或依赖本会话细节的工作自己做。`,
+				"subagent：委派期间不要修改与子 Agent 相同的文件；子会话不是文件系统沙箱，写入类工具由 Agent 配置授予。",
+			],
 			description: [
-				"将一个自包含任务同步委派给独立上下文的 Agent，只返回最终回答，不继承父会话历史。",
-				`单任务用 agent + task；多个互相独立的只读调查用 tasks 数组一次提交（1–${MAX_TASKS_PER_CALL} 项），按输入顺序返回逐项结果。两种模式互斥。`,
-				`只读 Agent（工具白名单全部是 ${READ_ONLY_TOOLS.join("/")}，或已知只读的扩展工具 ${READ_ONLY_EXTENSION_TOOLS.join("/")}）最多同时运行 ${MAX_CONCURRENCY} 个（父会话内所有 subagent 调用共用一个队列），多出的排队；含写入或名单外扩展工具的 Agent 无法静态判断是否写盘，会独占执行，期间不与其他子任务并行。`,
-				"等待和执行均可取消，执行超时为 10 分钟；单个任务失败不影响其他任务，全部失败才报错。",
-				`默认工具为只读 ${READ_ONLY_TOOLS.join(", ")}；声明可信只读来源（${TRUSTED_SOURCE_NAMES}）后，省略 tools 会按来源实际注册的工具一并启用其只读工具。写入/命令工具必须在 Agent 定义里显式授予；pi 没有权限弹窗，授权只发生在配置这一步，授予后子会话会直接执行。`,
-				"主 Agent 不得在委派期间修改与子 Agent 相同的文件。子会话不是文件系统沙箱。",
-				"默认继承当前模型与 thinking；不继承父扩展、自定义工具或仅存在于父进程的 provider/认证配置。",
-				"扩展只在 Agent 声明 extensions 时按已安装来源显式加载，不会自动安装或发现其他扩展；可信只读来源的只读工具在省略 tools 时自动启用（来源没注册的名字静默忽略），其余扩展工具名必须列在 tools 中，写进 tools 的名字缺一个就拒绝启动。",
-				"单个任务与整次调用的模型可见输出各至多 50 KiB / 2000 行；超限时完整内容写入临时文件（单任务 result.md，整次调用 parallel.md），返回文本里给出路径。",
+				"把一个自包含任务同步委派给独立上下文的 Agent，只返回它的最终回答；子会话不继承父会话历史，可用工具由 Agent 定义决定。",
+				`单任务用 agent + task；多个互相独立的调查用 tasks（1–${MAX_TASKS_PER_CALL} 项，按输入顺序返回逐项结果）。两种模式互斥。`,
+				`只读 Agent 共享并发槽，最多 ${MAX_CONCURRENCY} 个同时运行（父会话内所有调用共用一个队列），超出的排队；可能写盘的任务独占执行。执行上限 10 分钟，等待和执行均可取消，单个任务失败不影响其他任务。`,
+				"单任务与整次调用的返回文本各至多 50 KiB / 2000 行，超限时完整内容写入临时文件，并在返回文本里给出路径。",
 				configError ? `配置加载失败，委派已禁用：${configError}` : `可用 Agent：\n${listing || "（无）"}`,
 				loadedCwd && !listing ? configurationHint(loadedCwd) : "",
 			].filter(Boolean).join("\n"),
