@@ -1,0 +1,28 @@
+{
+  "name": "pi-deepwiki",
+  "version": "0.1.0",
+  "description": "Native Pi tools for the official DeepWiki MCP server",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "deepwiki",
+    "mcp"
+  ],
+  "files": [
+    "index.ts",
+    "src",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}
