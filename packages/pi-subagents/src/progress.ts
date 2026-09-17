@@ -8,7 +8,7 @@ export const TERMINAL_STATES: ReadonlySet<RunState> = new Set<RunState>([
 	"failed",
 ]);
 
-/** 非状态变化的合并窗口：并行时 N 个任务的高频事件只触发一次重绘。 */
+/** 非状态变化的合并窗口：多项任务并发时，高频事件只合并成一次重绘。 */
 const COALESCE_MS = 200;
 
 /** 单任务状态。index 是唯一的稳定排序键，乱序完成时展示顺序也不变。 */
@@ -23,8 +23,8 @@ export interface TaskProgress {
 	fullOutputPath?: string;
 }
 
-/** 一次工具调用的完整进度快照：单任务即 tasks.length === 1，并行即 N 个任务。 */
-export interface ParallelProgress {
+/** 一次工具调用的完整进度快照：单项调用即 tasks.length === 1。 */
+export interface CallProgress {
 	tasks: TaskProgress[];
 }
 
@@ -32,9 +32,9 @@ export interface ParallelProgress {
 export type TaskSink = (progress: RunProgress) => void;
 
 /**
- * 把任务级进度合并成 ParallelProgress。
+ * 把任务级进度合并成 CallProgress。
  *
- * 与调度解耦：每次 run() 注册一个 task(index)，并行调用只是对每个任务各注册一次，
+ * 与调度解耦：每次 run() 注册一个 task(index)，多项调用只是对每个任务各注册一次，
  * 本模块与渲染层都不需要知道并发上限、队列位置或任务数量。
  * 状态变化立即刷新，只变了最近工具时合并到一个窗口。
  */
@@ -44,7 +44,7 @@ export class ProgressHub {
 	private disposed = false;
 
 	/** flush 只做展示（onUpdate），内部吞掉异常，不得影响子任务执行。 */
-	constructor(private readonly flush: (progress: ParallelProgress) => void) {}
+	constructor(private readonly flush: (progress: CallProgress) => void) {}
 
 	/** 注册任务并返回它的进度汇入点；同一 index 重复注册会重置该任务状态。 */
 	task(index: number, agent: string): TaskSink {
@@ -65,7 +65,7 @@ export class ProgressHub {
 	}
 
 	/** 当前 details 快照：tasks 按 index 升序，与事件到达顺序无关。 */
-	snapshot(): ParallelProgress {
+	snapshot(): CallProgress {
 		const tasks = [...this.tasks.values()]
 			.sort((left, right) => left.index - right.index)
 			.map((task) => ({ ...task }));
@@ -96,7 +96,7 @@ export class ProgressHub {
 	}
 
 	/** 立即刷新并返回同一份快照。 */
-	private flushNow(): ParallelProgress {
+	private flushNow(): CallProgress {
 		this.clearTimer();
 		const progress = this.snapshot();
 		try {

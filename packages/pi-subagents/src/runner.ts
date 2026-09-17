@@ -31,7 +31,7 @@ const ABORT_GRACE_MS = 5000;
  */
 const DEFAULT_CHILD_EXTENSIONS = ["npm:@ff-labs/pi-fff"];
 
-/** 父会话内只读子任务的并发上限：同一并行调用内的任务与模型并行发出的多个单任务调用共用这一个池。 */
+/** 父会话内只读子任务的并发上限：同一调用内的多项任务与模型连续发出的多次调用共用这一个池。 */
 export const MAX_CONCURRENCY = 3;
 
 type FailureKind = "cancelled" | "timeout" | "startup" | "authentication" | "model"
@@ -507,7 +507,7 @@ export class SubagentRunner {
 
 	/** 只按需创建临时目录：没有截断就不留任何文件。 */
 	private async retainFullOutput(output: { text: string; lastTool?: string }, signal: AbortSignal): Promise<RunResult> {
-		const fullOutputPath = await this.retainFullText(output.text);
+		const fullOutputPath = await this.retainFullText(output.text, "result.md");
 		checkCancelled(signal);
 		const notice = `[结果已截断。完整回答：${fullOutputPath}；保留至父会话关闭、切换或 /reload。]\n\n`;
 		const preview = truncateHead(output.text, {
@@ -518,10 +518,10 @@ export class SubagentRunner {
 	}
 
 	/**
-	 * 写入完整输出并返回路径。临时目录注册进 retainedDirs，由 shutdown 统一清理，
-	 * 因此取消、超时或父会话关闭都不会遗留文件。
+	 * 写入完整输出并返回路径。文件名由调用方决定：单项结果 `result.md`，整次报告 `report.md`。
+	 * 临时目录注册进 retainedDirs，由 shutdown 统一清理，因此取消、超时或父会话关闭都不会遗留文件。
 	 */
-	async retainFullText(text: string, fileName = "result.md"): Promise<string> {
+	async retainFullText(text: string, fileName: string): Promise<string> {
 		let dir: string | undefined;
 		try {
 			dir = await mkdtemp(join(tmpdir(), "pi-subagents-"));

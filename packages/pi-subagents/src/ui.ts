@@ -1,6 +1,6 @@
 import { getMarkdownTheme, keyHint, type Theme, type ThemeColor } from "@earendil-works/pi-coding-agent";
 import { Markdown, Text, sliceByColumn, visibleWidth, type Component } from "@earendil-works/pi-tui";
-import type { ParallelProgress, TaskProgress } from "./progress.ts";
+import type { CallProgress, TaskProgress } from "./progress.ts";
 import { TERMINAL_STATES } from "./progress.ts";
 import type { RunState } from "./runner.ts";
 
@@ -57,13 +57,14 @@ function activeMark(state: RunState, theme: Theme, at: number): string {
 	return theme.fg(activeColor(state), spinnerFrame(at));
 }
 
-/** 截断提示由 runner 拼进模型可见文本，UI 已单独标注截断状态，预览里必须去掉这段噪声。 */
-const TRUNCATION_NOTICE = /^\[结果已截断[^\]]*\]\n*/u;
+/**
+ * 截断提示由 runner 拼进模型可见文本，UI 已用任务行单独标注截断状态，正文里必须去掉这段噪声。
+ * 多项任务时提示跟随各小节出现，因此按行匹配并全局清除。
+ */
+const TRUNCATION_NOTICE = /^\[结果已截断[^\]]*\]\n*/gmu;
 
-/** 工具参数：现在只有 agent/task；tasks 留给并行模式，属性全部按未知值防御。 */
+/** 工具参数：唯一入口是 tasks 数组，属性全部按未知值防御。 */
 export interface SubagentCallArgs {
-	agent?: unknown;
-	task?: unknown;
 	tasks?: unknown;
 }
 
@@ -84,37 +85,48 @@ export interface SubagentResultOptions {
 
 /**
  * onUpdate 的一行文本。非 UI 上下文（RPC、print）也会收到它，因此保持纯文本、不含富信息。
- * 并行分支：一行汇总加最近变化，顺序固定，不会被最后一个事件覆盖已有状态。
+ * 单项与多项共用同一节：先给成功计数（与报告头部同一口径），再给当前任务，顺序固定，不会被最后一个事件覆盖已有状态。
  */
-export function formatProgressText(progress: ParallelProgress): string {
-	if (progress.tasks.length <= 1) {
-		const task = progress.tasks[0];
-		if (!task) return "子任务尚未开始。";
-		const parts = [stateLabel(task.state)];
-		if (task.lastTool) parts.push(`最近工具：${task.lastTool}`);
-		const elapsed = elapsedText(task);
-		if (elapsed) parts.push(`已用时 ${elapsed}`);
-		return `${task.agent}：${parts.join("；")}`;
-	}
+export function formatProgressText(progress: CallProgress): string {
 	const total = progress.tasks.length;
-	const finished = progress.tasks.filter((task) => TERMINAL_STATES.has(task.state)).length;
+	if (total === 0) return "子任务尚未开始。";
+	// 只数成功：失败、超时、取消都不算，与报告头部的 `N/M 成功` 保持一致。
+	const succeeded = progress.tasks.filter((task) => task.state === "completed").length;
 	const running = progress.tasks.filter((task) => !TERMINAL_STATES.has(task.state) && task.state !== "waiting").length;
 	const queued = progress.tasks.filter((task) => task.state === "waiting").length;
 	const current = progress.tasks.find((task) => !TERMINAL_STATES.has(task.state));
-	const parts = [`${finished}/${total} 完成`];
-	if (running > 0) parts.push(`${running} 个执行中`);
+	const parts = [`${succeeded}/${total} 成功`];
+	// 单项任务里“1 个执行中”与后面点名的那个任务是同一件事，只在真的并发时才单给计数。
+	if (running > 1) parts.push(`${running} 个执行中`);
 	if (queued > 0) parts.push(`${queued} 个排队中`);
 	if (current) {
-		parts.push(`${current.agent} ${stateLabel(current.state)}${current.lastTool ? `（最近工具：${current.lastTool}）` : ""}`);
+		const elapsed = elapsedText(current);
+		const detail = [
+			current.lastTool ? `最近工具：${current.lastTool}` : "",
+			elapsed ? `已用时 ${elapsed}` : "",
+		].filter(Boolean).join("；");
+		parts.push(`${current.agent} ${stateLabel(current.state)}${detail ? `（${detail}）` : ""}`);
 	}
 	return parts.join("；");
 }
 
-/** 工具行标题：单任务只给 Agent 名，并行只给任务数；任务内容一律不进调用行。 */
+/** 工具行标题：只给 Agent 名单（重复出现折叠成 ×n），单项与多项同一风格；任务内容一律不进调用行。 */
 export function renderSubagentCall(args: SubagentCallArgs | undefined, theme: Theme): Component {
-	const taskCount = Array.isArray(args?.tasks) ? args.tasks.length : 0;
-	const subject = taskCount > 0 ? `parallel ${taskCount}` : agentName(args?.agent);
-	return new Text(theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("accent", subject), 0, 0);
+	return new Text(theme.fg("toolTitle", theme.bold("subagent ")) + theme.fg("accent", agentSummary(args?.tasks)), 0, 0);
+}
+
+/** 按输入顺序列出 Agent，同名折叠成 `名字 ×n`；参数流式到达时允许只有部分项。 */
+function agentSummary(tasks: unknown): string {
+	if (!Array.isArray(tasks) || tasks.length === 0) return "（未指定 Agent）";
+	const counts = new Map<string, number>();
+	for (const entry of tasks) {
+		const item = typeof entry === "object" && entry !== null && !Array.isArray(entry)
+			? (entry as { agent?: unknown }).agent
+			: undefined;
+		const name = agentName(item);
+		counts.set(name, (counts.get(name) ?? 0) + 1);
+	}
+	return [...counts].map(([name, count]) => (count > 1 ? `${name} ×${count}` : name)).join("、");
 }
 
 /** 工具结果：details 可用时渲染任务列表，被 Pi 清空时（出错）退回纯文本。 */
@@ -124,7 +136,7 @@ export function renderSubagentResult(
 	options: SubagentResultOptions,
 ): Component {
 	const text = textOf(result.content);
-	const details = result.details as ParallelProgress | undefined;
+	const details = result.details as CallProgress | undefined;
 	const tasks = Array.isArray(details?.tasks) ? details.tasks : [];
 	// 分片推进期间登记重绘节拍（动画圈 + 耗时靠自己跳动），终态渲染时注销。
 	if (options.isPartial && tasks.length > 0) {
@@ -216,9 +228,9 @@ interface TaskListOptions {
 }
 
 /**
- * 结果视图：单任务与并行走同一形态——执行中只给状态行，完成后折叠态追加展开提示，展开态追加任务明细与完整回答。
+ * 结果视图：单项与多项走同一形态——执行中只给状态行，完成后折叠态追加展开提示，展开态追加任务明细与完整回答。
  *
- * 布局只取决于 tasks.length，不依赖并发上限、调度策略或任务数量，因此并行落地时无需改动。
+ * 布局只取决于 tasks.length，不依赖并发上限或调度策略。
  */
 class TaskListComponent implements Component {
 	constructor(private readonly options: TaskListOptions) {}
@@ -244,13 +256,13 @@ function buildLines(options: TaskListOptions, width: number): string[] {
 	}
 	// 执行期间的 content 就是那行进度文本：只给状态，不追加明细或提示（detail 已为假）。
 	if (isPartial) return lines;
-	// 单任务截断时，提示文字已在上面用结构化形式给出，正文里不再重复一遍。
-	const body = (tasks.length === 1 && tasks[0]?.truncated ? text.replace(TRUNCATION_NOTICE, "") : text).trim();
+	// 截断提示已由任务行用结构化形式给出（含完整结果路径），正文里不再重复一遍。
+	const body = text.replace(TRUNCATION_NOTICE, "").trim();
 	if (detail) {
 		if (body) lines.push("", ...new Markdown(body, 0, 0, getMarkdownTheme()).render(width));
 		return lines;
 	}
-	// 折叠态一律只给状态与展开提示：单任务也不再截取回答预览，两种模式保持同一形态。
+	// 折叠态一律只给状态与展开提示，正文预览只放在展开态。
 	if (body) lines.push(keyHint("app.tools.expand", "展开完整回答"));
 	return lines;
 }
