@@ -1,8 +1,6 @@
-# pi-subagents v0.2
+# pi-subagents
 
 一个同步的 `subagent` 工具：主 Agent 指定角色和完整任务，子 Agent 在独立会话中执行，只把最终回答返回给主 Agent。一次调用可以委派一个任务，也可以提交最多 4 个互相独立的只读调查并行执行。
-
-基于 **Pi 0.85.1 SDK**，子会话在父进程内用 `createAgentSession` 创建，不启动 Pi CLI 子进程，不提供跨版本兼容层。2026-09-17 在 Pi 0.85.1 + `deepseek/deepseek-flash` 上完成运行验证（并行任务顺序、部分失败、并发上限、写 Agent 独占、取消、截断与清理），清单与证据见 [subagents-v0.2-parallel-plan.md](../../subagents-v0.2-parallel-plan.md) 的「运行验证结果」；动画圈与 `ctrl+o` 展开等 TUI 观感仍需人眼确认。
 
 ## 安装
 
