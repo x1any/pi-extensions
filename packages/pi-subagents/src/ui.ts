@@ -1,5 +1,5 @@
 import { getMarkdownTheme, keyHint, type Theme, type ThemeColor } from "@earendil-works/pi-coding-agent";
-import { Markdown, Text, truncateToWidth, type Component } from "@earendil-works/pi-tui";
+import { Markdown, Text, sliceByColumn, visibleWidth, type Component } from "@earendil-works/pi-tui";
 import type { ParallelProgress, TaskProgress, TaskUsage } from "./progress.ts";
 import { TERMINAL_STATES } from "./progress.ts";
 import type { RunState } from "./runner.ts";
@@ -16,6 +16,8 @@ const MAX_VISIBLE_TASKS = 4;
 const PREVIEW_LINES = 3;
 /** renderCall 里任务预览的最大列宽：此时拿不到终端宽度，短终端交给 Text 自行换行。 */
 const CALL_PREVIEW_WIDTH = 80;
+/** 截断提示占 3 列，与 pi-tui 默认省略号等宽。 */
+const ELLIPSIS = "...";
 
 /** 状态文案：只用于非 UI 通道（onUpdate 的一行文本）。 */
 const STATE_LABELS: Record<RunState, string> = {
@@ -261,7 +263,7 @@ function buildLines(options: TaskListOptions, width: number): string[] {
 	if (multi) lines.push(summaryLine(tasks, theme, isError, at));
 	const { shown, hidden } = selectTasks(tasks, expanded ? tasks.length : MAX_VISIBLE_TASKS);
 	for (const task of shown) {
-		lines.push(...taskLines(task, theme, multi, expanded, at).map((line) => truncateToWidth(line, width)));
+		lines.push(...taskLines(task, theme, multi, expanded, at).map((line) => clipToWidth(line, width)));
 	}
 	if (hidden > 0) lines.push(theme.fg("muted", `  ... 另有 ${hidden} 项`));
 	// 执行期间的 content 就是那行进度文本，不能当回答预览，也不能提示展开。
@@ -340,7 +342,22 @@ function previewLines(text: string, truncated: boolean, theme: Theme, width: num
 		.map((line) => line.trimEnd())
 		.filter((line) => line.length > 0)
 		.slice(0, PREVIEW_LINES)
-		.map((line) => theme.fg("toolOutput", truncateToWidth(line, width)));
+		.map((line) => theme.fg("toolOutput", clipToWidth(line, width)));
+}
+
+/**
+ * 按可见宽度截断并补省略号。
+ *
+ * 不能用 pi-tui 的 truncateToWidth：它在省略号两侧插全量重置（\x1b[0m），
+ * 而 Pi 的工具卡片靠外层 Box 给整行铺底色，全量重置会把底色一起清掉，
+ * 省略号及其右侧会回落成终端默认底色（前景色也会一起丢）。
+ */
+function clipToWidth(text: string, maxWidth: number): string {
+	if (maxWidth <= 0) return "";
+	if (visibleWidth(text) <= maxWidth) return text;
+	// 极窄宽度下省略号自己也要裁，否则会返回 3 列、超出 maxWidth。
+	if (maxWidth <= ELLIPSIS.length) return ELLIPSIS.slice(0, maxWidth);
+	return sliceByColumn(text, 0, maxWidth - ELLIPSIS.length, true) + ELLIPSIS;
 }
 
 function agentName(value: unknown): string {
@@ -350,7 +367,7 @@ function agentName(value: unknown): string {
 function previewLine(value: unknown): string | undefined {
 	if (typeof value !== "string") return undefined;
 	const collapsed = value.replace(/\s+/gu, " ").trim();
-	return collapsed ? truncateToWidth(collapsed, CALL_PREVIEW_WIDTH) : undefined;
+	return collapsed ? clipToWidth(collapsed, CALL_PREVIEW_WIDTH) : undefined;
 }
 
 function stateLabel(state: RunState): string {
