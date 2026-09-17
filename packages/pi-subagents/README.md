@@ -36,17 +36,18 @@ tools: read, grep, find, ls
 | --- | --- |
 | `name` | 必填，调用时使用准确名称 |
 | `description` | 必填，列入工具描述 |
-| `tools` | 工具白名单，逗号分隔字符串或 YAML 列表；省略为 `read, grep, find, ls`；`[]` 为完全禁用。内置工具为 `read, grep, find, ls, edit, write, powershell, bash`，其余名称视为扩展工具 |
-| `extensions` | 可选，只在本子会话加载的扩展来源（本地路径或已安装来源，如 `npm:pi-web-access`）；省略或 `[]` 为不加载 |
+| `tools` | 工具白名单，逗号分隔字符串或 YAML 列表；省略为 `read, grep, find, ls` 加已声明可信只读来源的只读工具；`[]` 为完全禁用。内置工具为 `read, grep, find, ls, edit, write, powershell, bash`，其余名称视为扩展工具。写进 `tools` 的名字必须在子会话里真实注册，缺一个就拒绝启动；自动启用的名字按来源实际注册情况生效 |
+| `extensions` | 可选，只在本子会话加载的扩展来源（本地路径或已安装来源，如 `npm:pi-web-access`）；省略或 `[]` 为不加载。声明后，来源随包提供的 skills 会一并加载（受 settings 里该包的过滤器约束，可单独关闭 skills），包内提示词模板与主题不加载 |
 | `model` | 可选，完整 `provider/model`，默认继承父会话当前模型 |
 | `thinking` | 可选，`off/minimal/low/medium/high/xhigh/max`，默认继承父会话 |
 
 仅支持以上字段。Markdown 正文以追加系统提示注入，不替换系统提示词，也不读取父会话的追加提示词或 `APPEND_SYSTEM.md`。
 
-两个易错点：
+三个易错点：
 
 - 显式空值（`tools:`、`tools: ""`）无效，禁用全部工具必须写 `tools: []`。
-- 扩展工具要同时配置两处：名字写进 `tools`，提供它的扩展写进 `extensions`。`extensions` 不会安装或下载任何东西；来源未安装、被禁用或路径不存在时拒绝启动。
+- 扩展工具要配置两处：提供它的扩展写进 `extensions`，省略 `tools` 时该来源的只读工具自动启用；只有可信只读来源（`@ff-labs/pi-fff`、`pi-web-access`、`@upstash/context7-pi`）能这样免写名字，其余来源的工具必须逐名列进 `tools`，写全名单也就覆盖了默认值。自动启用的名字只在该来源确实注册了同名工具时才生效（pi-fff 的 multi-grep 需 `PI_FFF_MULTIGREP=1`，pi-web-access 的工具可按功能开关单独关闭），缺了只是不启用；写进 `tools` 的名字是硬要求，缺一个就拒绝启动。`extensions` 不会安装或下载任何东西；来源未安装、被禁用或路径不存在时拒绝启动。
+- `tools` 里不能写 `auto`：省略 `tools` 就等价于自动包含已声明可信只读来源的只读工具，要精确控制就逐名列出。
 
 配置解析错误、未知字段、重复条目或同目录重名会报告来源路径，并**禁用全部委派直至修正后 `/reload`**。没有任何定义时工具返回配置指引。定义在会话启动、切换和 `/reload` 时刷新，没有文件监听器。
 
@@ -93,10 +94,10 @@ subagent({
 ## 权限与隔离边界
 
 - 默认只读。`edit`、`write`、`powershell`、`bash` 必须在 Agent 定义里显式授予；**授权只发生在这一步**：pi 没有内置权限弹窗，也没有沙箱（官方 README：“No permission popups.”，`docs/security.md`：“Pi does not include a built-in sandbox.”）。子会话一旦拿到写工具，就会以与父进程相同的用户权限直接执行，不会再请求确认。
-- **并行只对只读 Agent 生效**：工具白名单全部命中只读集合时共享并发槽——内置 `read`/`grep`/`find`/`ls`，以及已知只读的扩展工具：[pi-fff](https://github.com/dmtrKovalenko/fff/tree/main/packages/pi-fff) 的 `ffgrep`/`fffind`/`fff-multi-grep`（`override` 模式下另有 `multi_grep`）和 [pi-web-access](https://github.com/nicobailon/pi-web-access) 的 `web_search`/`source_check`/`fetch_content`/`get_search_content`。其他扩展工具和写入工具一律按未验证处理，独占执行。判定只影响调度，不拒绝调用，现有 Agent 定义无需修改。
-- 已知只读名单只看工具名，不检查扩展实现：这几个工具不改动工作目录，写入都在扩展自己的状态目录与临时目录（pi-fff 的索引与 frecency/history 库，pi-web-access 的 `web-search-cache`、`chrome-cookies` 临时副本、GitHub 克隆目录、PDF 产物）。两个扩展都允许在配置里改工具名（`toolNames` / `mode`），改过名的工具不在名单里，会按未验证独占。网络类工具并行会同时占用 provider 配额与速率限制。
+- **并行只对只读 Agent 生效**：工具白名单全部命中只读集合时共享并发槽——内置 `read`/`grep`/`find`/`ls`，以及已知只读的扩展工具：[pi-fff](https://github.com/dmtrKovalenko/fff/tree/main/packages/pi-fff) 的 `ffgrep`/`fffind`/`fff-multi-grep`（`override` 模式下另有 `multi_grep`）和 [pi-web-access](https://github.com/nicobailon/pi-web-access) 的 `web_search`/`source_check`/`fetch_content`/`get_search_content`，以及 context7（`@upstash/context7-pi`）的 `resolve-library-id`/`query-docs`。其他扩展工具和写入工具一律按未验证处理，独占执行。判定只影响调度，不拒绝调用，现有 Agent 定义无需修改。
+- 已知只读名单只看工具名，不检查扩展实现：这几个工具不改动工作目录，写入都在扩展自己的状态目录与临时目录（pi-fff 的索引与 frecency/history 库，pi-web-access 的 `web-search-cache`、`chrome-cookies` 临时副本、GitHub 克隆目录、PDF 产物）。pi-fff 与 pi-web-access 都允许在配置里改工具名（`toolNames` / `mode`），改过名的工具不在名单里，会按未验证独占。网络类工具并行会同时占用 provider 配额与速率限制。
 - 子会话**不是文件系统沙箱**：与父会话共享工作目录，读取工具也没有路径沙箱；写工具一旦在定义里授予就没有额外拦截。主 Agent 不应与子 Agent 同时修改相同文件；写入型 Agent 也不会与其他子任务重叠。
-- 子会话使用内存会话（等价 `--no-session`），关闭扩展、skills、提示词模板和主题的**自动发现**；无持久会话、无递归委派。只有 Agent 显式声明且已安装的 `extensions` 会加载，父会话已加载但未声明的扩展不会继承。
+- 子会话使用内存会话（等价 `--no-session`），关闭扩展、skills、提示词模板和主题的**自动发现**；无持久会话、无递归委派。只有 Agent 显式声明且已安装的 `extensions` 会加载，父会话已加载但未声明的扩展不会继承；声明来源随包提供的 skills 会跟着扩展进入子会话（受 settings 里该包的过滤器约束），父会话的 skills 不会继承。
 - 模型和认证必须在子会话自己的运行时中可解析（内置 provider、环境变量、普通 `models.json`/认证）。父进程动态注册的 provider、临时 API key 和扩展工具不会被复制；子会话事件中的 provider/model 必须与要求完全一致，不接受静默回退。
 - 取消、超时、会话关闭/切换和重载会 `abort()` 并等待会话结束，随后 `dispose()`；同一进程内没有需要终止的进程树。取消后未在宽限期内结束时放弃等待并释放会话，此时不再保证模型请求立即停止。
 

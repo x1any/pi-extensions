@@ -6,6 +6,7 @@ import {
 	getAgentDir,
 	parseFrontmatter,
 } from "@earendil-works/pi-coding-agent";
+import { normalizeSource } from "./extensions.ts";
 
 export type ThinkingLevel = NonNullable<ExtensionContext["thinkingLevel"]>;
 
@@ -13,7 +14,8 @@ const READ_ONLY_TOOLS = ["read", "grep", "find", "ls"];
 const BUILTIN_TOOLS = new Set([...READ_ONLY_TOOLS, "edit", "write", "powershell", "bash"]);
 
 /**
- * 已知只读的扩展工具：只读的含义是不改动工作目录。
+ * 已知只读的扩展来源：来源（忽略 `npm:` 前缀与版本号）→ 省略 `tools` 时自动启用的只读工具。
+ * 只读的含义是不改动工作目录。
  *
  * - pi-fff（`@ff-labs/pi-fff`）：`ffgrep`/`fffind`/`fff-multi-grep`；`override` 模式下第三个工具叫
  *   `multi_grep`（`grep`/`find` 已被内置只读名单覆盖）。
@@ -23,16 +25,18 @@ const BUILTIN_TOOLS = new Set([...READ_ONLY_TOOLS, "edit", "write", "powershell"
  * pi-fff 与 pi-web-access 的写入都在扩展自己的状态目录与临时目录（pi-fff 的索引与 frecency/history 库，
  * pi-web-access 的 web-search-cache、GitHub 克隆、PDF 产物），不在工作目录里，父会话用同一批工具时也在写；
  * context7 只发远端查询，扩展内没有落盘代码。
- * 这里只按工具名判定，不检查扩展实现；这些扩展都允许在配置里改工具名，改过名的工具不在名单里。
+ * 这里只按工具名判定，不检查扩展实现；这些扩展都允许在配置里改工具名，改过名的工具不在名单里，
+ * 因此默认只能带上下列默认名字，改过名仍要显式列出。
+ * 下列名字也未必都注册：pi-fff 的 multi-grep 只在 `PI_FFF_MULTIGREP=1` 时注册，pi-web-access 的每个
+ * 工具都能按功能开关单独关闭，所以自动启用只能按「来源注册了同名工具才生效」处理。
+ * 名单外的扩展工具无法静态判断是否写盘：既不会自动启用，也按未验证处理（独占调度）。
  */
-const READ_ONLY_EXTENSION_TOOLS = [
-	// pi-fff
-	"ffgrep", "fffind", "fff-multi-grep", "multi_grep",
-	// pi-web-access（默认工具名）：网络搜索与抓取，不落盘到工作目录
-	"web_search", "source_check", "fetch_content", "get_search_content",
-	// context7（默认工具名）：远端文档查询，无本地写入
-	"resolve-library-id", "query-docs",
-];
+const TRUSTED_READ_ONLY_SOURCES: Record<string, string[]> = {
+	"@ff-labs/pi-fff": ["ffgrep", "fffind", "fff-multi-grep", "multi_grep"],
+	"pi-web-access": ["web_search", "source_check", "fetch_content", "get_search_content"],
+	"@upstash/context7-pi": ["resolve-library-id", "query-docs"],
+};
+const READ_ONLY_EXTENSION_TOOLS = [...new Set(Object.values(TRUSTED_READ_ONLY_SOURCES).flat())];
 const READ_ONLY_TOOL_SET = new Set([...READ_ONLY_TOOLS, ...READ_ONLY_EXTENSION_TOOLS]);
 const THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 const FIELDS = new Set(["name", "description", "tools", "extensions", "model", "thinking"]);
@@ -41,7 +45,13 @@ export interface AgentConfig {
 	name: string;
 	description: string;
 	tools: string[];
-	/** 只在本 Agent 子会话中显式加载的扩展来源：本地路径或已安装的 npm/git 来源。 */
+	/**
+	 * 必须在子会话工具注册表中存在的名字：frontmatter 显式写出的工具，或是省略 tools 时的内置只读工具。
+	 * 省略 tools 时自动展开的扩展工具不在此列：来源没注册同名工具（功能开关关闭、改过名、只在 override
+	 * 模式注册）时只是不启用该名字，不拒绝启动。
+	 */
+	requiredTools: string[];
+	/** 只在本 Agent 子会话中显式加载的扩展来源：本地路径或已安装的 npm/git 来源；来源随包提供的 skills 一并加载。 */
 	extensions: string[];
 	model?: string;
 	thinking?: ThinkingLevel;
@@ -60,6 +70,7 @@ export function isBuiltinToolName(name: string): boolean {
  *
  * 其余含 edit、write、powershell、bash 或名单外扩展工具名时无法静态判断是否写盘，一律视为未验证，
  * 由调度器按独占处理。判定只影响调度，不拒绝调用，因此现有 Agent 定义无需修改。
+ * 省略 tools 时自动包含可信来源的只读工具，展开结果全在只读集合内，这类 Agent 仍然是只读 Agent。
  */
 export function isReadOnlyAgent(agent: AgentConfig): boolean {
 	return agent.tools.every((tool) => READ_ONLY_TOOL_SET.has(tool));
@@ -79,14 +90,31 @@ function requiredString(value: unknown, field: string): string {
 	return value.trim();
 }
 
-function parseTools(value: unknown): string[] {
-	if (value === undefined) return [...READ_ONLY_TOOLS];
+/**
+ * 省略 tools 时的默认白名单：内置只读工具 + 已声明可信来源的只读工具。
+ * 只读判定发生在建子会话之前（取并发槽时），所以这里只认静态来源表，不查扩展注册表。
+ * 展开出的扩展工具只作可选启用：来源没注册同名工具时由子会话静默忽略，也不参与启动校验。
+ */
+function defaultTools(extensions: string[]): string[] {
+	const tools = new Set(READ_ONLY_TOOLS);
+	for (const source of extensions) {
+		for (const tool of TRUSTED_READ_ONLY_SOURCES[normalizeSource(source)] ?? []) tools.add(tool);
+	}
+	return [...tools];
+}
+
+function parseTools(value: unknown, extensions: string[]): Pick<AgentConfig, "tools" | "requiredTools"> {
+	// 省略 tools：内置只读工具必然注册，仍按硬要求校验；扩展工具按来源实际注册情况生效。
+	if (value === undefined) return { tools: defaultTools(extensions), requiredTools: [...READ_ONLY_TOOLS] };
 	const items: unknown[] = typeof value === "string" ? value.split(",") : Array.isArray(value) ? value : [];
 	if (typeof value !== "string" && !Array.isArray(value)) {
 		throw new Error("tools 必须是逗号分隔的字符串或 YAML 列表；禁用全部工具请使用 tools: []。");
 	}
 	const tools = items.map((item) => requiredString(item, "tools 中的工具名称"));
 	for (const tool of tools) {
+		if (tool.toLowerCase() === "auto") {
+			throw new Error("tools 不需要写 auto：省略 tools 时会自动包含已声明可信来源的只读工具；要精确控制就逐名列出。");
+		}
 		if (/[\s\u0000-\u001f\u007f]/u.test(tool)) {
 			throw new Error(`工具名称 ${JSON.stringify(tool)} 不能包含空白或控制字符。`);
 		}
@@ -96,8 +124,8 @@ function parseTools(value: unknown): string[] {
 	}
 	if (new Set(tools).size !== tools.length) throw new Error("tools 中存在重复名称。");
 	// 非内置名称视为扩展/自定义工具：名字只做白名单，不加载注册它的扩展。
-	// 实际是否存在由子会话启动前对照其工具注册表校验，缺一个就拒绝启动。
-	return tools;
+	// 显式写出的名字由子会话启动前对照其工具注册表校验，缺一个就拒绝启动。
+	return { tools, requiredTools: [...tools] };
 }
 
 function parseExtensions(value: unknown): string[] {
@@ -140,8 +168,9 @@ function loadDirectory(dir: string, source: AgentConfig["source"]): Map<string, 
 			const name = requiredString(frontmatter.name, "name");
 			if (/[\u0000-\u001f\u007f]/u.test(name)) throw new Error("name 不能包含控制字符或换行。");
 			const description = requiredString(frontmatter.description, "description");
-			const tools = parseTools(frontmatter.tools);
 			const extensions = parseExtensions(frontmatter.extensions);
+			// 默认工具名单依赖声明的来源，所以 extensions 先解析。
+			const { tools, requiredTools } = parseTools(frontmatter.tools, extensions);
 			const model = frontmatter.model === undefined ? undefined : requiredString(frontmatter.model, "model");
 			if (model !== undefined && !/^[^/\s]+\/[^\s]+$/u.test(model)) {
 				throw new Error("model 必须使用完整 provider/model 标识；thinking 请单独配置。");
@@ -155,7 +184,7 @@ function loadDirectory(dir: string, source: AgentConfig["source"]): Map<string, 
 			const duplicate = agents.get(name);
 			if (duplicate) throw new Error(`同一目录内 Agent ${JSON.stringify(name)} 重名，另一文件：${duplicate.filePath}。`);
 			agents.set(name, {
-				name, description, tools, extensions, model, thinking: thinking as ThinkingLevel | undefined,
+				name, description, tools, requiredTools, extensions, model, thinking: thinking as ThinkingLevel | undefined,
 				systemPrompt: body, source, filePath,
 			});
 		} catch (error) {
@@ -180,7 +209,7 @@ export function discoverAgents(cwd: string, projectTrusted: boolean): AgentDisco
 export function configurationHint(cwd: string): string {
 	return [
 		`请在 ${join(getAgentDir(), "agents")} 或受信任项目的 ${join(cwd, CONFIG_DIR_NAME, "agents")} 中创建 Agent Markdown 文件，然后 /reload。`,
-		"必填 frontmatter 为 name、description；省略 tools 时仅启用 read, grep, find, ls。扩展不会自动创建配置。",
-		"扩展工具需要在 tools 中列出名字，并在 extensions 中声明已安装的扩展来源；不会自动安装缺失的扩展。",
+		"必填 frontmatter 为 name、description；省略 tools 时启用 read, grep, find, ls，若声明了可信只读来源还包含该来源的只读工具。扩展不会自动创建配置。",
+		"扩展工具需要在 extensions 中声明已安装的扩展来源；省略 tools 时会自动包含该来源的只读工具（按来源实际注册情况生效），其余扩展工具需逐名列出。不会自动安装缺失的扩展。",
 	].join("");
 }

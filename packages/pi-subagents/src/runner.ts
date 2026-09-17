@@ -206,7 +206,7 @@ interface FinalAnswer {
  * 在父进程内创建一个独立的 Pi 会话。
  *
  * 与旧版 spawn 一个 `pi --mode json --print` 子进程等价：全新上下文、无持久会话、不自动发现扩展与技能，
- * 只按 Agent 配置启用工具白名单、显式加载声明的扩展，并追加角色正文作为系统提示。
+ * 只按 Agent 配置启用工具白名单、显式加载声明的扩展（含来源随包提供的 skills），并追加角色正文作为系统提示。
  * 不复制父会话内存态的 provider、认证和扩展工具；这些仍由普通 Pi 配置在子运行时中解析。
  */
 async function createChildSession(request: RunRequest): Promise<AgentSession> {
@@ -231,6 +231,7 @@ async function createChildSession(request: RunRequest): Promise<AgentSession> {
 		throw new SubagentError("model", resolved.error ?? `子会话模型目录中不存在 ${request.provider}/${request.modelId}。`);
 	}
 	let extensionPaths: string[] = [];
+	let skillPaths: string[] = [];
 	if (request.agent.extensions.length > 0) {
 		let missing: string[] = [];
 		try {
@@ -238,6 +239,7 @@ async function createChildSession(request: RunRequest): Promise<AgentSession> {
 				cwd: request.cwd, agentDir, settingsManager,
 			});
 			extensionPaths = resolution.paths;
+			skillPaths = resolution.skillPaths;
 			missing = resolution.missing;
 		} catch (error) {
 			throw new SubagentError("startup", `无法解析 Agent 声明的扩展：${errorText(error)}`);
@@ -252,11 +254,13 @@ async function createChildSession(request: RunRequest): Promise<AgentSession> {
 		settingsManager,
 		// 等价于旧版的 --no-extensions --no-skills --no-prompt-templates --no-themes：
 		// 不做环境发现，只加载 Agent 显式声明的扩展；也不会在同一进程里再加载一份本扩展。
+		// 声明来源随包提供的 skills 由 additionalSkillPaths 显式传入，不依赖全局发现。
 		noExtensions: true,
 		noSkills: true,
 		noPromptTemplates: true,
 		noThemes: true,
 		additionalExtensionPaths: extensionPaths,
+		additionalSkillPaths: skillPaths,
 		// 显式空值加 override，只追加角色正文，不读取 APPEND_SYSTEM.md，也不把正文当成文件路径。
 		appendSystemPrompt: [],
 		appendSystemPromptOverride: () => (request.agent.systemPrompt.trim() ? [request.agent.systemPrompt] : []),
@@ -302,10 +306,14 @@ function isDeclaredExtensionPath(path: string, declared: string[]): boolean {
 	});
 }
 
-/** Pi 的工具白名单会静默忽略未注册的名字，所以在启动前对照子会话注册表校验。 */
+/**
+ * Pi 的工具白名单会静默忽略未注册的名字，所以在启动前对照子会话注册表校验。
+ * 只校验 requiredTools（frontmatter 显式写出的名字）：省略 tools 时自动带上的扩展工具
+ * 可能因功能开关或改名而不存在，那些名字由子会话静默忽略。
+ */
 function checkDeclaredTools(request: RunRequest, session: AgentSession): void {
 	const provided = new Set(session.getAllTools().map((tool) => tool.name));
-	const missing = request.agent.tools.filter((name) => !provided.has(name));
+	const missing = request.agent.requiredTools.filter((name) => !provided.has(name));
 	if (missing.length === 0) return;
 	const fromExtensions = [...new Set(session.extensionRunner.getAllRegisteredTools()
 		.map((tool) => tool.definition.name)

@@ -1,7 +1,6 @@
 ---
 name: researcher
 description: 联网研究代理，用 pi-web-access 检索、抓取与核查来源，输出带引用的结论。
-tools: read, web_search, source_check, fetch_content, get_search_content
 extensions: npm:pi-web-access
 model: deepseek/deepseek-flash
 thinking: low
