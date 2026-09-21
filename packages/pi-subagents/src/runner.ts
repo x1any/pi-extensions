@@ -47,9 +47,17 @@ export class SubagentError extends Error {
 export type RunState = "waiting" | "starting" | "running" | "tool" | "retrying" | "finishing"
 	| "completed" | "cancelled" | "timed_out" | "failed";
 
+export interface ToolProgressEvent {
+	id: string;
+	name: string;
+	phase: "started" | "finished";
+	isError?: boolean;
+}
+
 export interface RunProgress {
 	state: RunState;
 	lastTool?: string;
+	tool?: ToolProgressEvent;
 }
 
 export interface RunRequest {
@@ -94,9 +102,9 @@ function isAuthFailure(text: string): boolean {
 	return /\b(401|403|unauthorized|unauthenticated)\b|authentication|no api key|api key.*(missing|invalid|not found)|oauth|not logged in|credentials.*(missing|expired|invalid)/i.test(text);
 }
 
-function emit(request: RunRequest, state: RunState, lastTool?: string): void {
+function emit(request: RunRequest, state: RunState, lastTool?: string, tool?: ToolProgressEvent): void {
 	try {
-		request.onProgress?.({ state, lastTool });
+		request.onProgress?.({ state, lastTool, tool });
 	} catch {
 		// 展示失败不能中断会话释放或执行槽回收。
 	}
@@ -347,6 +355,7 @@ async function runSession(request: RunRequest, signal: AbortSignal): Promise<{ t
 
 	let answer: FinalAnswer | undefined;
 	let lastTool: string | undefined;
+	const activeTools = new Map<string, string>();
 	let failure: SubagentError | undefined;
 	let promptFailure: unknown;
 	let abandoned = false;
@@ -354,6 +363,11 @@ async function runSession(request: RunRequest, signal: AbortSignal): Promise<{ t
 	const fail = (error: SubagentError) => {
 		failure ??= error;
 		void session.abort().catch(() => {});
+	};
+	const activeToolName = (): string | undefined => {
+		let name: string | undefined;
+		for (const active of activeTools.values()) name = active;
+		return name;
 	};
 	const handleEvent = (event: AgentSessionEvent): void => {
 		if ((event.type === "message_start" || event.type === "message_end") && event.message.role === "assistant") {
@@ -383,10 +397,21 @@ async function runSession(request: RunRequest, signal: AbortSignal): Promise<{ t
 				return;
 			}
 			lastTool = event.toolName;
-			emit(request, "tool", lastTool);
+			activeTools.set(event.toolCallId, event.toolName);
+			emit(request, "tool", lastTool, {
+				id: event.toolCallId, name: event.toolName, phase: "started",
+			});
 			return;
 		}
-		if (event.type === "tool_execution_end" || event.type === "agent_start") {
+		if (event.type === "tool_execution_end") {
+			activeTools.delete(event.toolCallId);
+			lastTool = activeToolName() ?? event.toolName;
+			emit(request, activeTools.size > 0 ? "tool" : "running", lastTool, {
+				id: event.toolCallId, name: event.toolName, phase: "finished", isError: event.isError,
+			});
+			return;
+		}
+		if (event.type === "agent_start") {
 			emit(request, "running", lastTool);
 			return;
 		}

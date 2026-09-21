@@ -137,6 +137,8 @@ function taskSpecs(params: { tasks?: unknown }): TaskSpec[] {
 
 export default function (pi: ExtensionAPI): void {
 	let runner = new SubagentRunner();
+	/** execute 抛错时 Pi 会清空 details；暂存最终快照，交给 tool_result 钩子回填。 */
+	const failedDetails = new Map<string, SubagentDetails>();
 	let discovery: AgentDiscovery | undefined;
 	let configError: string | undefined;
 	let loadedCwd: string | undefined;
@@ -260,20 +262,22 @@ export default function (pi: ExtensionAPI): void {
 					if (outcomes.every((outcome) => !outcome.result)) throw new Error(readableError(report));
 					return { content: [{ type: "text", text: await boundReport(report, outcomes) }], details };
 				} catch (error) {
-					// Pi 出错时会丢弃 details，只把错误文本交给模型；这里保证每行收敛到终态。
+					// Pi 出错时会丢弃 details；先让每行收敛，再暂存快照供 tool_result 钩子回填。
 					const state = failureState(error, signal);
 					for (const sink of sinks) sink({ state });
+					const details = hub.snapshot();
+					if (details.tasks.length > 0) failedDetails.set(toolCallId, details);
 					throw new Error(readableError(error));
 				} finally {
 					hub.dispose();
 				}
 			},
-			renderCall(_args, theme) {
-				return renderSubagentCall(theme);
+			renderCall(args, theme) {
+				return renderSubagentCall(args, theme);
 			},
 			renderResult(result, options, theme, context) {
 				return renderSubagentResult(result, theme, {
-					...options, isError: context.isError,
+					...options, isError: context.isError, args: context.args,
 					toolCallId: context.toolCallId, invalidate: context.invalidate,
 				});
 			},
@@ -282,6 +286,7 @@ export default function (pi: ExtensionAPI): void {
 
 	async function refresh(ctx: ExtensionContext): Promise<void> {
 		ticker.dispose();
+		failedDetails.clear();
 		await runner.shutdown();
 		runner = new SubagentRunner();
 		discovery = undefined;
@@ -300,10 +305,19 @@ export default function (pi: ExtensionAPI): void {
 		}
 	}
 
+	/** 保留错误语义（execute 继续 throw），同时恢复自定义渲染所需的结构化 details。 */
+	pi.on("tool_result", (event) => {
+		if (event.toolName !== "subagent") return;
+		const details = failedDetails.get(event.toolCallId);
+		failedDetails.delete(event.toolCallId);
+		if (event.isError && event.details === undefined && details) return { details };
+	});
+
 	registerTool();
 	pi.on("session_start", (_event, ctx) => refresh(ctx));
 	pi.on("session_shutdown", () => {
 		ticker.dispose();
+		failedDetails.clear();
 		return runner.shutdown();
 	});
 }

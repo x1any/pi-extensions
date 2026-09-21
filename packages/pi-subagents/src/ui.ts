@@ -1,6 +1,6 @@
 import { getMarkdownTheme, keyHint, type Theme, type ThemeColor } from "@earendil-works/pi-coding-agent";
 import { Markdown, Text, sliceByColumn, visibleWidth, type Component } from "@earendil-works/pi-tui";
-import type { CallProgress, TaskProgress } from "./progress.ts";
+import type { CallProgress, TaskProgress, ToolCallProgress, ToolCallState } from "./progress.ts";
 import { TERMINAL_STATES } from "./progress.ts";
 import type { RunState } from "./runner.ts";
 
@@ -41,6 +41,12 @@ const TERMINAL_MARKS: Partial<Record<RunState, StateMark>> = {
 	cancelled: { glyph: "⊘", color: "muted", label: "已取消" },
 };
 
+const TOOL_MARKS: Partial<Record<ToolCallState, StateMark>> = {
+	completed: { glyph: "✓", color: "success" },
+	failed: { glyph: "✗", color: "error", label: "失败" },
+	interrupted: { glyph: "⊘", color: "muted", label: "已中断" },
+};
+
 /** 动画圈取当前时间的帧，因此同一时刻所有行相位一致，也不需要额外状态。 */
 function spinnerFrame(at: number): string {
 	return SPINNER_FRAMES[Math.floor(at / SPINNER_MS) % SPINNER_FRAMES.length] as string;
@@ -62,6 +68,8 @@ function activeMark(state: RunState, theme: Theme, at: number): string {
  * 多项任务时提示跟随各小节出现，因此按行匹配并全局清除。
  */
 const TRUNCATION_NOTICE = /^\[结果已截断[^\]]*\]\n*/gmu;
+/** 报告首行与树上汇总重复；只在展开渲染时移除，不改变模型可见 content。 */
+const REPORT_SUMMARY = /^\d+\/\d+ 成功(?:\r?\n)+/u;
 
 /** 工具结果：Pi 出错时会用空 details 覆盖部分结果，所以这里不假设 shape。 */
 export interface SubagentResult {
@@ -76,6 +84,7 @@ export interface SubagentResultOptions {
 	isError: boolean;
 	toolCallId: string;
 	invalidate: () => void;
+	args?: unknown;
 }
 
 /**
@@ -105,12 +114,41 @@ export function formatProgressText(progress: CallProgress): string {
 	return parts.join("；");
 }
 
-/** 工具行标题：只给工具名，Agent 名单与任务内容都不进调用行。 */
-export function renderSubagentCall(theme: Theme): Component {
-	return new Text(theme.fg("toolTitle", theme.bold("subagent")), 0, 0);
+/** 从调用参数恢复计划任务；错误结果没有 details 时仍能保留树的基本形态。 */
+function plannedAgents(args: unknown): string[] {
+	if (typeof args !== "object" || args === null || Array.isArray(args)) return [];
+	const tasks = (args as { tasks?: unknown }).tasks;
+	if (!Array.isArray(tasks)) return [];
+	return tasks.map((task) => {
+		if (typeof task !== "object" || task === null || Array.isArray(task)) return "?";
+		const agent = (task as { agent?: unknown }).agent;
+		return typeof agent === "string" && agent.trim() ? agent.trim() : "?";
+	});
 }
 
-/** 工具结果：details 可用时渲染任务列表，被 Pi 清空时（出错）退回纯文本。 */
+/** 将结构化快照与调用参数合并；配置解析中途失败时，尚未注册的任务也不会从树上消失。 */
+function tasksForRender(details: CallProgress | undefined, args: unknown, isError: boolean): TaskProgress[] {
+	const structured = Array.isArray(details?.tasks) ? details.tasks : [];
+	const planned = plannedAgents(args);
+	if (planned.length === 0) return structured;
+	const byIndex = new Map(structured.map((task) => [task.index, task]));
+	return planned.map((agent, position) => byIndex.get(position + 1) ?? {
+		index: position + 1,
+		agent,
+		state: isError ? "failed" : "waiting",
+		tools: [],
+		omittedTools: 0,
+	});
+}
+
+/** 工具行标题作为树根，只显示静态任务数；实时汇总放在结果区域。 */
+export function renderSubagentCall(args: unknown, theme: Theme): Component {
+	const count = plannedAgents(args).length;
+	const suffix = count > 0 ? theme.fg("muted", ` · ${count} 项`) : "";
+	return new Text(theme.fg("toolTitle", theme.bold("subagent")) + suffix, 0, 0);
+}
+
+/** 工具结果：优先使用 details；错误清空 details 时从调用参数恢复任务骨架。 */
 export function renderSubagentResult(
 	result: SubagentResult,
 	theme: Theme,
@@ -118,7 +156,7 @@ export function renderSubagentResult(
 ): Component {
 	const text = textOf(result.content);
 	const details = result.details as CallProgress | undefined;
-	const tasks = Array.isArray(details?.tasks) ? details.tasks : [];
+	const tasks = tasksForRender(details, options.args, options.isError);
 	// 分片推进期间登记重绘节拍（动画圈 + 耗时靠自己跳动），终态渲染时注销。
 	if (options.isPartial && tasks.length > 0) {
 		ticker.watch(options.toolCallId, options.invalidate);
@@ -229,43 +267,97 @@ function buildLines(options: TaskListOptions, width: number): string[] {
 	const multi = tasks.length > 1;
 	// 明细只在完成后生效：执行期间按展开键也只给状态，进度文本不是回答，不该被当成结果铺开。
 	const detail = expanded && !isPartial;
-	// 一次渲染固定一帧，同一行里所有任务用同一个动画相位。
+	// 一次渲染固定一帧，同一行里所有任务与工具用同一个动画相位。
 	const at = Date.now();
-	const lines: string[] = [];
-	for (const task of tasks) {
-		lines.push(...taskLines(task, theme, multi, detail, at).map((line) => clipToWidth(line, width)));
+	const lines: string[] = [clipToWidth(summaryLine(tasks, isPartial, theme), width)];
+	for (let index = 0; index < tasks.length; index += 1) {
+		const task = tasks[index] as TaskProgress;
+		lines.push(...taskLines(
+			task, theme, multi, detail, isPartial, at, index === tasks.length - 1,
+		).map((line) => clipToWidth(line, width)));
 	}
-	// 执行期间的 content 就是那行进度文本：只给状态，不追加明细或提示（detail 已为假）。
+	// 执行期间的 content 就是那行进度文本：树已经包含进度，不再重复追加纯文本。
 	if (isPartial) return lines;
-	// 截断提示已由任务行用结构化形式给出（含完整结果路径），正文里不再重复一遍。
+	// 截断提示已由任务节点用结构化形式给出（含完整结果路径），正文里不再重复一遍。
 	const body = text.replace(TRUNCATION_NOTICE, "").trim();
+	const report = body.replace(REPORT_SUMMARY, "").trim();
 	if (detail) {
-		if (body) lines.push("", ...new Markdown(body, 0, 0, getMarkdownTheme()).render(width));
+		if (report) {
+			lines.push("", clipToWidth(theme.fg("muted", "完整回答"), width));
+			lines.push(...new Markdown(report, 0, 0, getMarkdownTheme()).render(width));
+		}
 		return lines;
 	}
-	// 折叠态一律只给状态与展开提示，正文预览只放在展开态。
+	// 折叠态一律只给树与展开提示，正文预览只放在展开态。
 	if (body) lines.push(keyHint("app.tools.expand", "展开完整回答"));
 	return lines;
 }
 
-function taskLines(task: TaskProgress, theme: Theme, multi: boolean, detail: boolean, at: number): string[] {
+function summaryLine(tasks: TaskProgress[], isPartial: boolean, theme: Theme): string {
+	const succeeded = tasks.filter((task) => task.state === "completed").length;
+	const parts = [theme.fg(succeeded === tasks.length ? "success" : "accent", `${succeeded}/${tasks.length} 成功`)];
+	if (isPartial) {
+		const running = tasks.filter((task) => !TERMINAL_STATES.has(task.state) && task.state !== "waiting").length;
+		const queued = tasks.filter((task) => task.state === "waiting").length;
+		if (running > 0) parts.push(theme.fg("accent", `${running} 个执行中`));
+		if (queued > 0) parts.push(theme.fg("muted", `${queued} 个排队中`));
+	} else {
+		const unsuccessful = tasks.filter((task) => TERMINAL_STATES.has(task.state) && task.state !== "completed").length;
+		if (unsuccessful > 0) parts.push(theme.fg("warning", `${unsuccessful} 个未成功`));
+	}
+	return parts.join(theme.fg("muted", " · "));
+}
+
+function taskLines(
+	task: TaskProgress,
+	theme: Theme,
+	multi: boolean,
+	detail: boolean,
+	isPartial: boolean,
+	at: number,
+	isLastTask: boolean,
+): string[] {
 	const terminal = TERMINAL_MARKS[task.state];
-	const parts = [terminal ? theme.fg(terminal.color, terminal.glyph) : activeMark(task.state, theme, at)];
+	const connector = theme.fg("borderMuted", isLastTask ? "└─" : "├─");
+	const parts = [connector, terminal ? theme.fg(terminal.color, terminal.glyph) : activeMark(task.state, theme, at)];
 	const label = `${multi ? `#${task.index} ` : ""}${task.agent}`;
 	parts.push(theme.fg("toolTitle", label));
 	// 进行中不写状态词，只有终态需要说明原因（失败/已超时/已取消）。
 	if (terminal?.label) parts.push(theme.fg("muted", "·"), theme.fg(terminal.color, terminal.label));
-	if (task.lastTool) parts.push(theme.fg("muted", `· ${task.lastTool}`));
+	const toolCount = (task.omittedTools ?? 0) + (task.tools?.length ?? 0);
+	if (toolCount > 0) parts.push(theme.fg("muted", `· ${toolCount} 个工具`));
+	else if (task.lastTool) parts.push(theme.fg("muted", `· ${task.lastTool}`));
 	const elapsed = elapsedText(task);
 	if (elapsed) parts.push(theme.fg("dim", `· ${elapsed}`));
 	if (task.truncated && !detail) parts.push(theme.fg("warning", "· 结果已截断"));
 	const lines = [parts.join(" ")];
-	if (!detail) return lines;
-	if (task.truncated) {
-		lines.push(theme.fg("warning", "  [结果已截断]"));
-		if (task.fullOutputPath) lines.push(theme.fg("dim", `  完整结果：${task.fullOutputPath}`));
+
+	const children: string[] = [];
+	if (detail && (task.omittedTools ?? 0) > 0) {
+		children.push(theme.fg("muted", `… ${task.omittedTools} 个更早的工具调用`));
+	}
+	const tools = task.tools ?? [];
+	const visibleTools = detail ? tools : isPartial && !terminal ? tools.slice(-1) : [];
+	for (const tool of visibleTools) children.push(toolText(tool, theme, at));
+	if (detail && task.truncated) {
+		const path = task.fullOutputPath ? theme.fg("dim", ` · ${task.fullOutputPath}`) : "";
+		children.push(theme.fg("warning", "结果已截断") + path);
+	}
+	const stem = theme.fg("borderMuted", isLastTask ? "   " : "│  ");
+	for (let index = 0; index < children.length; index += 1) {
+		const childConnector = theme.fg("borderMuted", index === children.length - 1 ? "└─" : "├─");
+		lines.push(`${stem}${childConnector} ${children[index]}`);
 	}
 	return lines;
+}
+
+function toolText(tool: ToolCallProgress, theme: Theme, at: number): string {
+	const terminal = TOOL_MARKS[tool.state];
+	const mark = terminal ? theme.fg(terminal.color, terminal.glyph) : activeMark("tool", theme, at);
+	const parts = [mark, theme.fg("accent", tool.name)];
+	if (terminal?.label) parts.push(theme.fg(terminal.color, `· ${terminal.label}`));
+	parts.push(theme.fg("dim", `· ${formatDuration((tool.endedAt ?? at) - tool.startedAt)}`));
+	return parts.join(" ");
 }
 
 /**
@@ -293,7 +385,9 @@ function elapsedText(task: TaskProgress): string | undefined {
 }
 
 function formatDuration(ms: number): string {
-	const seconds = Math.max(0, Math.round(ms / 1000));
+	const elapsedMs = Math.max(0, ms);
+	if (elapsedMs < 1000) return "<1s";
+	const seconds = Math.round(elapsedMs / 1000);
 	const minutes = Math.floor(seconds / 60);
 	if (minutes < 60) return `${String(minutes).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
 	return `${Math.floor(minutes / 60)}h${String(minutes % 60).padStart(2, "0")}m`;
