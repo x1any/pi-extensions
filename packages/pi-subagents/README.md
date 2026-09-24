@@ -45,14 +45,14 @@ tools: read, grep, find, ls
 | --- | --- |
 | `name` | 必填，调用时使用准确名称 |
 | `description` | 必填，列入工具描述 |
-| `tools` | 工具白名单，逗号分隔字符串或 YAML 列表；省略为 `read, grep, find, ls` 加已声明可信只读来源的只读工具，`[]` 禁用全部。内置为 `read`/`grep`/`find`/`ls`/`edit`/`write`/`powershell`/`bash`，其余视为扩展工具；显式写出的名字必须真实注册，缺一个就拒绝启动，自动启用的名字缺失时忽略 |
-| `extensions` | 可选，在默认来源之外额外加载的扩展来源（本地路径或已安装来源，如 `git:github.com/x1any/pi-extensions`）；省略或 `[]` 表示只加载默认来源。不会安装或下载任何东西；来源随包提供的 skills 会一并加载。来源不可用（未安装、未启用或路径不存在）时跳过该来源，子会话用已注册的工具继续；声明的来源被跳过时会在结果文本里注明 |
+| `tools` | 工具白名单，逗号分隔字符串或 YAML 列表；省略时只启用 `read, grep, find, ls`，`[]` 禁用全部。内置为 `read`/`grep`/`find`/`ls`/`edit`/`write`/`powershell`/`bash`，扩展工具需逐名列出；显式写出的名字必须真实注册，缺一个就拒绝启动 |
+| `extensions` | 可选，在默认来源之外额外加载的扩展来源（本地路径或已安装来源，如 `git:github.com/x1any/pi-extensions`）；**省略**时从父会话已加载的 `tools` 反查扩展入口及已启用的包来源，显式 `[]` 则只加载默认来源，显式指定来源时不再推导。不会安装或下载任何东西；包来源随包提供的 skills 会一并加载，推导出的本地文件仅加载该入口。来源不可用（未安装、未启用或路径不存在）时跳过该来源，子会话用已注册的工具继续；缺失来源会在结果文本里注明 |
 | `model` | 可选，完整 `provider/model`，默认继承父会话当前模型 |
 | `thinking` | 可选，`off/minimal/low/medium/high/xhigh/max`，默认继承父会话 |
 
-子会话默认加载 `npm:@ff-labs/pi-fff`，不需要在 Agent 里声明：装了就由 FFF 提供 `grep`/`find`（pi-fff 处于 `override` 模式时同名覆盖内置实现，模式来自全局 `pi-fff.json`），没装或未启用就静默跳过、回退 Pi 内置 `grep`/`find`；默认来源缺失不写进结果文本，声明的来源缺失才提示。默认来源只放检索/只读能力，加载失败（来源存在但自身报错）仍然报错。
+子会话默认加载 `npm:@ff-labs/pi-fff`，不需要在 Agent 里声明：装了就由 FFF 提供 `grep`/`find`（pi-fff 处于 `override` 模式时同名覆盖内置实现，模式来自全局 `pi-fff.json`），没装或未启用就静默跳过、回退 Pi 内置 `grep`/`find`；默认来源缺失不写进结果文本，显式声明或从工具推导的来源缺失才提示。默认来源只放检索/只读能力，加载失败（来源存在但自身报错）仍然报错。
 
-联网调查参考 [`examples/researcher.md`](examples/researcher.md)，公共 GitHub 仓库的 DeepWiki 问答参考 [`examples/deepwiki.md`](examples/deepwiki.md)。两者都声明同一个已安装的 Git 仓库来源：子会话会加载该来源中**全部已启用**的扩展，但 Agent 的 `tools` 白名单分别只允许调用自己的工具。示例显式要求工具存在：来源缺失或过滤掉所需工具时会拒绝启动。子会话结束时会通知扩展清理 MCP 连接与临时文件。推送并完成 Git 安装前，现有用户级 Agent 的本地包路径仍可使用；确认安装后把对应定义的 `extensions` 改为 `git:github.com/x1any/pi-extensions`，再 `/reload`。
+联网调查参考 [`examples/researcher.md`](examples/researcher.md)，公共 GitHub 仓库的 DeepWiki 问答参考 [`examples/deepwiki.md`](examples/deepwiki.md)。示例只列 `tools`、省略 `extensions`：父会话先安装并启用 Exa / DeepWiki 所在的 Git 包，子会话才可通过已注册工具的入口路径反查该包来源；已加载的其他包（如 Context7）也按相同方式推导。子会话会加载推导出的包中**全部已启用**的扩展，但只允许调用 `tools` 白名单中的工具。父会话未加载的工具需显式声明可加载的 `extensions`，否则子会话会因缺工具而失败；SDK/内联工具没有可复用的扩展入口。本地扩展入口可直接推导为文件路径，但不会自动附带整包 skills。子会话结束时会通知扩展清理 MCP 连接与临时文件。来源推导在会话启动及 `/reload` 时刷新，推送并完成 Git 安装前，现有用户级 Agent 的本地来源仍可显式声明。
 
 仅支持以上字段。Markdown 正文以追加系统提示注入，不替换系统提示词，也不读取父会话的追加提示词或 `APPEND_SYSTEM.md`。
 
@@ -84,8 +84,8 @@ subagent({
 
 ### 调度与限制
 
-- 并发：只读 Agent 共享并发槽，最多 3 个同时运行，父会话内所有 `subagent` 调用共用一个队列，超出的排队；含写入或名单外扩展工具的任务无法静态判断是否写盘，会独占执行，期间不与其他子任务并行。
+- 并发：仅使用 `read`/`grep`/`find`/`ls` 的 Agent 共享并发槽，最多 3 个同时运行；其他工具（含全部扩展工具）无法可靠判断是否写盘，会独占执行，期间不与其他子任务并行。父会话内所有 `subagent` 调用共用一个队列，超出的排队。
 - 执行上限固定 10 分钟，等待与执行均可取消；单个任务失败不影响其他任务（失败原因写在对应小节）。
 - 输出上限：单项结果与整次调用的报告各至多 50 KiB / 2000 行，超限时完整内容写入临时文件（单项 `result.md`，整次报告 `report.md`），保留到父会话关闭、切换或 `/reload`。
 - 委派期间主 Agent 不要修改与子 Agent 相同的文件；子会话不是文件系统沙箱，写入与命令工具由 Agent 的 `tools` 授予，pi 不会在运行时弹权限确认。
-- 子会话不继承父会话的扩展、自定义工具或只存在于父进程的 provider/认证状态：除默认来源外只加载 Agent 声明的 `extensions`，模型与 thinking 默认继承父会话，也可由 Agent 覆盖。
+- 子会话不继承父会话的扩展、自定义工具或只存在于父进程的 provider/认证状态：除默认来源外只加载 Agent 显式声明或由父会话已加载 `tools` 推导的来源，模型与 thinking 默认继承父会话，也可由 Agent 覆盖。

@@ -3,10 +3,13 @@ import {
 	type ExtensionContext,
 	DEFAULT_MAX_BYTES,
 	DEFAULT_MAX_LINES,
+	getAgentDir,
+	SettingsManager,
 	truncateHead,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { type AgentConfig, type AgentDiscovery, type ThinkingLevel, configurationHint, discoverAgents } from "./src/agents.ts";
+import { type AgentConfig, type AgentDiscovery, type ThinkingLevel, configurationHint, discoverAgents, isBuiltinToolName } from "./src/agents.ts";
+import { inferLoadedToolSources } from "./src/extensions.ts";
 import { type CallProgress, ProgressHub, type TaskSink } from "./src/progress.ts";
 import { MAX_CONCURRENCY, type RunResult, type RunState, SubagentError, SubagentRunner } from "./src/runner.ts";
 import { formatProgressText, renderSubagentCall, renderSubagentResult, ticker } from "./src/ui.ts";
@@ -293,7 +296,20 @@ export default function (pi: ExtensionAPI): void {
 		configError = undefined;
 		loadedCwd = ctx.cwd;
 		try {
-			discovery = discoverAgents(ctx.cwd, ctx.isProjectTrusted());
+			const found = discoverAgents(ctx.cwd, ctx.isProjectTrusted());
+			if (found.agents.some((agent) => agent.inferExtensions && agent.tools.some((tool) => !isBuiltinToolName(tool)))) {
+				const sources = await inferLoadedToolSources(pi.getAllTools(), {
+					cwd: ctx.cwd, agentDir: getAgentDir(),
+					settingsManager: SettingsManager.create(ctx.cwd, getAgentDir(), { projectTrusted: found.projectTrusted }),
+				});
+				for (const agent of found.agents) {
+					if (agent.inferExtensions) {
+						agent.extensions = [...new Set(agent.tools.flatMap((tool) =>
+							isBuiltinToolName(tool) ? [] : sources.get(tool) ?? []))];
+					}
+				}
+			}
+			discovery = found;
 		} catch (error) {
 			configError = readableError(error);
 		}

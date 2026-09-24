@@ -220,8 +220,8 @@ async function closeChildSession(session: AgentSession): Promise<void> {
  * 在父进程内创建一个独立的 Pi 会话。
  *
  * 与旧版 spawn 一个 `pi --mode json --print` 子进程等价：全新上下文、无持久会话、不自动发现扩展与技能，
- * 只按 Agent 配置启用工具白名单、默认加载 `npm:@ff-labs/pi-fff`（Agent 不用声明）、显式加载 Agent 声明的
- * 扩展（含来源随包提供的 skills），并追加角色正文作为系统提示。
+ * 只按 Agent 配置启用工具白名单、默认加载 `npm:@ff-labs/pi-fff`（Agent 不用声明）、加载 Agent 声明
+ * 或由父会话已加载工具推导的扩展（包来源含随包 skills），并追加角色正文作为系统提示。
  * 来源不可用（未安装、未启用或路径不存在）时跳过该来源，子会话用已注册的工具继续；只有显式写进 tools 的
  * 名字缺失才拒绝启动。
  * 不复制父会话内存态的 provider、认证和扩展工具；这些仍由普通 Pi 配置在子运行时中解析。
@@ -257,7 +257,7 @@ async function createChildSession(request: RunRequest): Promise<{ session: Agent
 		});
 		extensionPaths = resolution.paths;
 		skillPaths = resolution.skillPaths;
-		// 默认来源缺失属于正常回退（改用内置 grep/find），不写进结果文本；Agent 显式声明的才提示。
+		// 默认来源缺失属于正常回退（改用内置 grep/find），不写进结果文本；其他来源缺失才提示。
 		const defaults = new Set(DEFAULT_CHILD_EXTENSIONS.map((source) => normalizeSource(source)));
 		unavailableSources = resolution.missing.filter((source) => !defaults.has(normalizeSource(source)));
 	} catch (error) {
@@ -341,8 +341,7 @@ function isDeclaredExtensionPath(path: string, declared: string[]): boolean {
 
 /**
  * Pi 的工具白名单会静默忽略未注册的名字，所以在启动前对照子会话注册表校验。
- * 只校验 requiredTools（frontmatter 显式写出的名字）：省略 tools 时自动带上的扩展工具
- * 可能因功能开关或改名而不存在，那些名字由子会话静默忽略。
+ * 只校验 requiredTools（frontmatter 显式写出的名字，或省略 tools 时的内置只读工具）。
  * 缺的是来源不可用（已跳过）造成的，就在提示里点名来源，避免误指到扩展自身的启用条件。
  */
 function checkDeclaredTools(request: RunRequest, session: AgentSession, unavailableSources: string[]): void {
@@ -352,13 +351,13 @@ function checkDeclaredTools(request: RunRequest, session: AgentSession, unavaila
 	const fromExtensions = [...new Set(session.extensionRunner.getAllRegisteredTools()
 		.map((tool) => tool.definition.name)
 		.filter((name) => !isBuiltinToolName(name)))];
-	const hint = request.agent.extensions.length === 0
-		? "该 Agent 未声明 extensions（子会话只默认加载 pi-fff）；扩展工具需要在 tools 列出名字，并在 extensions 中声明已安装的来源。"
-		: unavailableSources.length > 0
-			? `已声明的扩展来源不可用：[${unavailableSources.join(", ")}]（未安装、未启用或路径不存在），因此没有注册任何工具。`
+	const hint = unavailableSources.length > 0
+		? `所需扩展来源不可用：[${unavailableSources.join(", ")}]（未安装、未启用或路径不存在）。`
+		: request.agent.extensions.length === 0
+			? "子会话仅默认加载 pi-fff；只有父会话已加载、且有可解析入口路径的扩展工具才能在省略 extensions 时推导来源，否则请显式声明来源。"
 			: fromExtensions.length > 0
 				? `已加载扩展注册的工具：[${fromExtensions.join(", ")}]。`
-				: "已声明的扩展没有注册任何工具，请检查扩展自身的启用条件。";
+				: "所需扩展没有注册对应工具，请检查扩展自身的启用条件。";
 	throw new SubagentError("startup", `子会话缺少 Agent 声明的工具：[${missing.join(", ")}]。${hint}`);
 }
 

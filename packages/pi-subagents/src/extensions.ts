@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
 import {
 	DefaultPackageManager,
+	type ExtensionAPI,
 	type SettingsManager,
 } from "@earendil-works/pi-coding-agent";
 
@@ -84,6 +85,32 @@ export function normalizeSource(value: string): string {
 
 function sameSource(declared: string, configured: string): boolean {
 	return declared.trim() === configured.trim() || normalizeSource(declared) === normalizeSource(configured);
+}
+
+/** 从父会话实际注册的工具入口反查启用的包来源；无法归属包的本地入口只加载该文件。 */
+export async function inferLoadedToolSources(
+	tools: ReturnType<ExtensionAPI["getAllTools"]>,
+	options: { cwd: string; agentDir: string; settingsManager: SettingsManager },
+): Promise<Map<string, string>> {
+	// 内置、SDK 和内联工具没有可供子会话加载的扩展入口。
+	const candidates = tools.filter((tool) => tool.sourceInfo.source === "local"
+		&& isAbsolute(tool.sourceInfo.path) && existsAsFileOrDirectory(tool.sourceInfo.path));
+	if (candidates.length === 0) return new Map();
+	const manager = new DefaultPackageManager(options);
+	const resolved = await manager.resolve(async () => "skip");
+	const sources = new Map<string, string>();
+	for (const tool of candidates) {
+		const path = tool.sourceInfo.path;
+		const matches = resolved.extensions.filter((entry) => sameLocalPath(entry.path, path));
+		const enabled = matches.find((entry) => entry.enabled);
+		// 包入口已被配置禁用时，不用本地文件路径绕过过滤器。
+		if (matches.length > 0 && !enabled) continue;
+		const source = enabled?.metadata.origin === "package" && !isLocalSource(enabled.metadata.source)
+			? enabled.metadata.source
+			: path;
+		sources.set(tool.name, source);
+	}
+	return sources;
 }
 
 export async function resolveAgentExtensions(

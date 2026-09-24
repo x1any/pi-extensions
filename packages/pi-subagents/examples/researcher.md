@@ -2,7 +2,6 @@
 name: researcher
 description: 联网研究代理，用 pi-exa 搜索并抓取原文，交叉核查来源后输出带引用的结论。
 tools: read, grep, find, ls, web_search, web_fetch
-extensions: git:github.com/x1any/pi-extensions
 model: deepseek/deepseek-flash
 thinking: low
 ---

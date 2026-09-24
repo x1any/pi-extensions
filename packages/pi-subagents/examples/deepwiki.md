@@ -2,7 +2,6 @@
 name: deepwiki
 description: 只读查询公共 GitHub 仓库的 DeepWiki 文档，回答代码库问题并比较仓库。
 tools: read, deepwiki_read_wiki_structure, deepwiki_read_wiki_contents, deepwiki_ask_question
-extensions: git:github.com/x1any/pi-extensions
 model: deepseek/deepseek-flash
 thinking: low
 ---
