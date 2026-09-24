@@ -92,9 +92,10 @@ export async function inferLoadedToolSources(
 	tools: ReturnType<ExtensionAPI["getAllTools"]>,
 	options: { cwd: string; agentDir: string; settingsManager: SettingsManager },
 ): Promise<Map<string, string>> {
-	// 内置、SDK 和内联工具没有可供子会话加载的扩展入口。
-	const candidates = tools.filter((tool) => tool.sourceInfo.source === "local"
-		&& isAbsolute(tool.sourceInfo.path) && existsAsFileOrDirectory(tool.sourceInfo.path));
+	// 只有扩展注册的工具指向磁盘上的入口文件：内置、SDK 和内联工具用 `<builtin:x>`、`<sdk:x>` 这类合成路径。
+	// 包来源的工具入口同样在磁盘上，其 source 是包来源串（`git:`/`npm:`）而不是 `local`，不能按 source 过滤。
+	const candidates = tools.filter((tool) => isAbsolute(tool.sourceInfo.path)
+		&& existsAsFileOrDirectory(tool.sourceInfo.path));
 	if (candidates.length === 0) return new Map();
 	const manager = new DefaultPackageManager(options);
 	const resolved = await manager.resolve(async () => "skip");
