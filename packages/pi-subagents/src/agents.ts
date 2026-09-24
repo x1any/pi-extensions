@@ -6,12 +6,11 @@ import {
 	getAgentDir,
 	parseFrontmatter,
 } from "@earendil-works/pi-coding-agent";
+import { BUILTIN_READ_ONLY_TOOLS, isReadOnlyTool } from "./read-only-tools.ts";
 
 export type ThinkingLevel = NonNullable<ExtensionContext["thinkingLevel"]>;
 
-const READ_ONLY_TOOLS = ["read", "grep", "find", "ls"];
-const READ_ONLY_TOOL_SET = new Set(READ_ONLY_TOOLS);
-const BUILTIN_TOOLS = new Set([...READ_ONLY_TOOLS, "edit", "write", "powershell", "bash"]);
+const BUILTIN_TOOLS = new Set([...BUILTIN_READ_ONLY_TOOLS, "edit", "write", "powershell", "bash"]);
 const THINKING_LEVELS: readonly ThinkingLevel[] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 const FIELDS = new Set(["name", "description", "tools", "extensions", "model", "thinking"]);
 
@@ -36,9 +35,9 @@ export function isBuiltinToolName(name: string): boolean {
 	return BUILTIN_TOOLS.has(name);
 }
 
-/** 扩展工具没有可靠的只读元数据；只让纯内置只读工具的 Agent 共享并发槽。 */
+/** 工具白名单全部命中只读清单（src/read-only-tools.ts）的 Agent 才共享并发槽。 */
 export function isReadOnlyAgent(agent: AgentConfig): boolean {
-	return agent.tools.every((tool) => READ_ONLY_TOOL_SET.has(tool));
+	return agent.tools.every((tool) => isReadOnlyTool(tool));
 }
 
 export interface AgentDiscovery {
@@ -57,7 +56,7 @@ function requiredString(value: unknown, field: string): string {
 
 function parseTools(value: unknown): Pick<AgentConfig, "tools" | "requiredTools"> {
 	// 不自动开放扩展工具；省略 tools 时只启用内置只读工具。
-	if (value === undefined) return { tools: [...READ_ONLY_TOOLS], requiredTools: [...READ_ONLY_TOOLS] };
+	if (value === undefined) return { tools: [...BUILTIN_READ_ONLY_TOOLS], requiredTools: [...BUILTIN_READ_ONLY_TOOLS] };
 	const items: unknown[] = typeof value === "string" ? value.split(",") : Array.isArray(value) ? value : [];
 	if (typeof value !== "string" && !Array.isArray(value)) {
 		throw new Error("tools 必须是逗号分隔的字符串或 YAML 列表；禁用全部工具请使用 tools: []。");

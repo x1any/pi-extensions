@@ -499,7 +499,7 @@ export class SubagentRunner {
 
 	run(request: RunRequest): Promise<RunResult> {
 		const signal = AbortSignal.any([this.lifetime.signal, ...(request.signal ? [request.signal] : [])]);
-		// 只读 Agent 共享并发槽；含写入或扩展工具时无法静态判断是否写盘，独占整个池。
+		// 只读 Agent 共享并发槽；工具不在只读清单（src/read-only-tools.ts）内时无法静态判断是否写盘，独占整个池。
 		const ticket = this.pool.acquire(isReadOnlyAgent(request.agent) ? "shared" : "exclusive");
 		const call = (async () => {
 			try {
