@@ -8,7 +8,7 @@ export const TERMINAL_STATES: ReadonlySet<RunState> = new Set<RunState>([
 	"failed",
 ]);
 
-/** 非状态变化的合并窗口：多项任务并发时，高频事件只合并成一次重绘。 */
+/** 高频进度事件合并成一次重绘的窗口。 */
 const COALESCE_MS = 200;
 /** 每个任务只保留最近的终态工具；仍在执行的工具不会为了命中上限而被丢弃。 */
 const MAX_TOOL_HISTORY = 20;
@@ -105,8 +105,7 @@ function interruptOpenTools(task: TaskProgress, at: number): boolean {
 /**
  * 把任务级进度合并成 CallProgress。
  *
- * 与调度解耦：每次 run() 注册一个 task(index)，多项调用只是对每个任务各注册一次，
- * 本模块与渲染层都不需要知道并发上限、队列位置或任务数量。
+ * 每次 run() 注册一个 task(index)；不感知并发上限、队列位置或任务数量。
  * 状态变化立即刷新，只变了最近工具时合并到一个窗口。
  */
 export class ProgressHub {

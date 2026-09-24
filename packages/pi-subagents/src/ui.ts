@@ -4,16 +4,16 @@ import type { CallProgress, TaskProgress, ToolCallProgress, ToolCallState } from
 import { TERMINAL_STATES } from "./progress.ts";
 import type { RunState } from "./runner.ts";
 
-/** 进行中的行统一用动画圈：状态词不进界面，避免堆砌状态。 */
+/** 进行中的行统一用动画圈，不写状态词。 */
 const SPINNER_MS = 120;
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/** details 缺失（出错被 Pi 清空）时的回退行数：与 Pi 自带 fallback 的 10 行保持一致。 */
+/** details 被清空时的回退行数，与 Pi 自带 fallback 一致。 */
 const FALLBACK_LINES = 10;
-/** 截断提示占 3 列，与 pi-tui 默认省略号等宽。 */
+/** 省略号占 3 列。 */
 const ELLIPSIS = "...";
 
-/** 状态文案：只用于非 UI 通道（onUpdate 的一行文本）。 */
+/** 状态文案：只用于 onUpdate 的一行文本。 */
 const STATE_LABELS: Record<RunState, string> = {
 	waiting: "排队中",
 	starting: "启动中",
@@ -33,7 +33,7 @@ interface StateMark {
 	label?: string;
 }
 
-/** 终态标记：只有终态需要在行里写明原因（失败/已超时/已取消）。 */
+/** 终态标记：只有失败/超时/取消在行里写明原因。 */
 const TERMINAL_MARKS: Partial<Record<RunState, StateMark>> = {
 	completed: { glyph: "✓", color: "success" },
 	failed: { glyph: "✗", color: "error", label: "失败" },
@@ -47,12 +47,12 @@ const TOOL_MARKS: Partial<Record<ToolCallState, StateMark>> = {
 	interrupted: { glyph: "⊘", color: "muted", label: "已中断" },
 };
 
-/** 动画圈取当前时间的帧，因此同一时刻所有行相位一致，也不需要额外状态。 */
+/** 动画圈按时间取帧：同一时刻所有行相位一致。 */
 function spinnerFrame(at: number): string {
 	return SPINNER_FRAMES[Math.floor(at / SPINNER_MS) % SPINNER_FRAMES.length] as string;
 }
 
-/** 排队是暗淡的，重试中换成警告色提示，两者都不额外加状态词。 */
+/** 排队用暗色、重试用警告色，都不加状态词。 */
 function activeColor(state: RunState): ThemeColor {
 	if (state === "waiting") return "muted";
 	if (state === "retrying") return "warning";
@@ -63,21 +63,18 @@ function activeMark(state: RunState, theme: Theme, at: number): string {
 	return theme.fg(activeColor(state), spinnerFrame(at));
 }
 
-/**
- * 截断提示由 runner 拼进模型可见文本，UI 已用任务行单独标注截断状态，正文里必须去掉这段噪声。
- * 多项任务时提示跟随各小节出现，因此按行匹配并全局清除。
- */
+/** 截断提示由 runner 拼在文本开头，UI 用结构化标注替代，正文里要去掉。 */
 const TRUNCATION_NOTICE = /^\[结果已截断[^\]]*\]\n*/gmu;
-/** 报告首行与树上汇总重复；只在展开渲染时移除，不改变模型可见 content。 */
+/** 旧会话多任务报告的首行汇总与树上重复，展开渲染时移除。 */
 const REPORT_SUMMARY = /^\d+\/\d+ 成功(?:\r?\n)+/u;
 
-/** 工具结果：Pi 出错时会用空 details 覆盖部分结果，所以这里不假设 shape。 */
+/** 工具结果：出错时 Pi 可能覆盖 details，这里不假设 shape。 */
 export interface SubagentResult {
 	content: ReadonlyArray<{ type: string; text?: string }>;
 	details?: unknown;
 }
 
-/** 渲染选项：直接复用 Pi 传入的结果选项，额外补上错误标记与重绘句柄。 */
+/** 渲染选项：Pi 选项 + 错误标记与重绘句柄。 */
 export interface SubagentResultOptions {
 	expanded: boolean;
 	isPartial: boolean;
@@ -87,36 +84,23 @@ export interface SubagentResultOptions {
 	args?: unknown;
 }
 
-/**
- * onUpdate 的一行文本。非 UI 上下文（RPC、print）也会收到它，因此保持纯文本、不含富信息。
- * 单项与多项共用同一节：先给成功计数（与报告头部同一口径），再给当前任务，顺序固定，不会被最后一个事件覆盖已有状态。
- */
+/** onUpdate 的一行文本（RPC、print 也会收到）：agent、状态与细节。 */
 export function formatProgressText(progress: CallProgress): string {
-	const total = progress.tasks.length;
-	if (total === 0) return "子任务尚未开始。";
-	// 只数成功：失败、超时、取消都不算，与报告头部的 `N/M 成功` 保持一致。
-	const succeeded = progress.tasks.filter((task) => task.state === "completed").length;
-	const running = progress.tasks.filter((task) => !TERMINAL_STATES.has(task.state) && task.state !== "waiting").length;
-	const queued = progress.tasks.filter((task) => task.state === "waiting").length;
-	const current = progress.tasks.find((task) => !TERMINAL_STATES.has(task.state));
-	const parts = [`${succeeded}/${total} 成功`];
-	// 单项任务里“1 个执行中”与后面点名的那个任务是同一件事，只在真的并发时才单给计数。
-	if (running > 1) parts.push(`${running} 个执行中`);
-	if (queued > 0) parts.push(`${queued} 个排队中`);
-	if (current) {
-		const elapsed = elapsedText(current);
-		const detail = [
-			current.lastTool ? `最近工具：${current.lastTool}` : "",
-			elapsed ? `已用时 ${elapsed}` : "",
-		].filter(Boolean).join("；");
-		parts.push(`${current.agent} ${stateLabel(current.state)}${detail ? `（${detail}）` : ""}`);
-	}
-	return parts.join("；");
+	const task = progress.tasks[0];
+	if (!task) return "子任务尚未开始。";
+	const elapsed = elapsedText(task);
+	const detail = [
+		task.lastTool ? `最近工具：${task.lastTool}` : "",
+		elapsed ? `已用时 ${elapsed}` : "",
+	].filter(Boolean).join("；");
+	return `${task.agent}：${stateLabel(task.state)}${detail ? `（${detail}）` : ""}`;
 }
 
-/** 从调用参数恢复计划任务；错误结果没有 details 时仍能保留树的基本形态。 */
+/** 从调用参数取任务名：新形态单个 agent，旧会话是多项 tasks。 */
 function plannedAgents(args: unknown): string[] {
 	if (typeof args !== "object" || args === null || Array.isArray(args)) return [];
+	const single = (args as { agent?: unknown }).agent;
+	if (typeof single === "string" && single.trim()) return [single.trim()];
 	const tasks = (args as { tasks?: unknown }).tasks;
 	if (!Array.isArray(tasks)) return [];
 	return tasks.map((task) => {
@@ -126,7 +110,7 @@ function plannedAgents(args: unknown): string[] {
 	});
 }
 
-/** 将结构化快照与调用参数合并；配置解析中途失败时，尚未注册的任务也不会从树上消失。 */
+/** 合并 details 与调用参数；details 缺失时用参数补骨架。 */
 function tasksForRender(details: CallProgress | undefined, args: unknown, isError: boolean): TaskProgress[] {
 	const structured = Array.isArray(details?.tasks) ? details.tasks : [];
 	const planned = plannedAgents(args);
@@ -141,14 +125,16 @@ function tasksForRender(details: CallProgress | undefined, args: unknown, isErro
 	});
 }
 
-/** 工具行标题作为树根，只显示静态任务数；实时汇总放在结果区域。 */
+/** 工具行标题：单任务给 agent 名，旧会话多任务给任务数。 */
 export function renderSubagentCall(args: unknown, theme: Theme): Component {
-	const count = plannedAgents(args).length;
-	const suffix = count > 0 ? theme.fg("muted", ` · ${count} 项`) : "";
+	const names = plannedAgents(args);
+	const suffix = names.length > 0
+		? theme.fg("muted", ` · ${names.length > 1 ? `${names.length} 项` : names[0]}`)
+		: "";
 	return new Text(theme.fg("toolTitle", theme.bold("subagent")) + suffix, 0, 0);
 }
 
-/** 工具结果：优先使用 details；错误清空 details 时从调用参数恢复任务骨架。 */
+/** 结果渲染：优先 details，缺失时从参数恢复骨架；单任务与旧会话分别渲染。 */
 export function renderSubagentResult(
 	result: SubagentResult,
 	theme: Theme,
@@ -157,12 +143,19 @@ export function renderSubagentResult(
 	const text = textOf(result.content);
 	const details = result.details as CallProgress | undefined;
 	const tasks = tasksForRender(details, options.args, options.isError);
-	// 分片推进期间登记重绘节拍（动画圈 + 耗时靠自己跳动），终态渲染时注销。
+	// 推进期间登记重绘节拍，终态注销。
 	if (options.isPartial && tasks.length > 0) {
 		ticker.watch(options.toolCallId, options.invalidate);
 	} else ticker.unwatch(options.toolCallId);
 	if (tasks.length === 0) {
 		return plainResult(text, options, theme);
+	}
+	// 新调用固定单任务：一张卡片一个回答。
+	if (tasks.length === 1) {
+		return new SingleTaskComponent({
+			task: tasks[0] as TaskProgress, text, theme,
+			expanded: options.expanded, isPartial: options.isPartial,
+		});
 	}
 	return new TaskListComponent({
 		tasks, text, theme,
@@ -170,7 +163,7 @@ export function renderSubagentResult(
 	});
 }
 
-/** details 被 Pi 清空时的回退（出错只有纯文本）：折叠态只给开头几行，超出的部分提示展开。 */
+/** details 被清空时的回退：折叠态只给开头几行。 */
 function plainResult(text: string, options: SubagentResultOptions, theme: Theme): Component {
 	const color: ThemeColor = options.isError ? "error" : "toolOutput";
 	const lines = text.split("\n");
@@ -184,13 +177,13 @@ function plainResult(text: string, options: SubagentResultOptions, theme: Theme)
 	return new Text(`${body}\n${hint}`, 0, 0);
 }
 
-/** 进行中的行靠时间自己跳动：整体只跑一个固定节拍的定时器。 */
+/** 进行中的行按固定节拍重绘：整体只用一个定时器。 */
 class Ticker {
 	private timer: ReturnType<typeof setInterval> | undefined;
 	private readonly rows = new Map<string, () => void>();
 
 	watch(toolCallId: string, invalidate: () => void): void {
-		// 拿不到重绘句柄就不要走表，否则定时器只会白跑。
+		// 没有重绘句柄就不走表。
 		if (typeof invalidate !== "function") return;
 		this.rows.set(toolCallId, invalidate);
 		this.reschedule();
@@ -201,7 +194,7 @@ class Ticker {
 		this.reschedule();
 	}
 
-	/** 会话结束或重载时清空，不留下指向旧界面的定时器。 */
+	/** 会话结束或重载时清空，不留指向旧界面的定时器。 */
 	dispose(): void {
 		this.rows.clear();
 		this.reschedule();
@@ -224,7 +217,7 @@ class Ticker {
 			try {
 				invalidate();
 			} catch {
-				// 行已销毁：下一次 unwatch 或 dispose 会清掉它。
+				// 行已销毁：后续 unwatch/dispose 会清掉。
 			}
 		}
 	}
@@ -235,8 +228,94 @@ class Ticker {
 	}
 }
 
-/** 模块级单例：定时器数量与并行行数无关。 */
+/** 模块级单例：定时器数量与行数无关。 */
 export const ticker = new Ticker();
+
+interface SingleTaskOptions {
+	task: TaskProgress;
+	text: string;
+	expanded: boolean;
+	isPartial: boolean;
+	theme: Theme;
+}
+
+/** 单任务卡片：标题给出 agent，结果区只画进度、状态说明与回答。 */
+class SingleTaskComponent implements Component {
+	constructor(private readonly options: SingleTaskOptions) {}
+
+	render(width: number): string[] {
+		return buildSingleLines(this.options, width);
+	}
+
+	/** 没有需要失效的缓存（Pi 会重建组件）。 */
+	invalidate(): void {}
+}
+
+function buildSingleLines(options: SingleTaskOptions, width: number): string[] {
+	const { task, text, expanded, isPartial, theme } = options;
+	// 明细只在完成后生效：进度文本不是回答。
+	const detail = expanded && !isPartial;
+	// 一次渲染固定一帧，动画与耗时同相位。
+	const at = Date.now();
+	const terminal = TERMINAL_MARKS[task.state];
+	const lines: string[] = [];
+
+	// 执行中给一行进度；完成后只给回答。
+	if (isPartial) {
+		lines.push(clipToWidth(progressLine(task, theme, at), width));
+	} else if (terminal?.label) {
+		// 只有失败/超时/取消写状态行，与普通工具结果一致。
+		lines.push(clipToWidth(statusLine(task, theme, at), width));
+	}
+	// 截断提示保留完整文件路径，是查看完整回答的入口。
+	if (!isPartial && task.truncated) {
+		const path = task.fullOutputPath ? theme.fg("dim", ` · ${task.fullOutputPath}`) : "";
+		lines.push(clipToWidth(theme.fg("warning", "结果已截断") + path, width));
+	}
+
+	// 执行期间 content 就是进度文本，不再重复追加。
+	if (isPartial) return lines;
+	const body = text.replace(TRUNCATION_NOTICE, "").trim();
+	if (!body) return lines;
+	if (detail) {
+		if (lines.length > 0) lines.push("");
+		lines.push(...new Markdown(body, 0, 0, getMarkdownTheme()).render(width));
+		return lines;
+	}
+	lines.push(...previewLines(body, theme, width));
+	return lines;
+}
+
+/** 执行中的进度行：动画圈 + 最近工具 + 耗时。 */
+function progressLine(task: TaskProgress, theme: Theme, at: number): string {
+	const parts = [markGlyph(task, theme, at)];
+	if (task.lastTool) parts.push(theme.fg("muted", `· ${task.lastTool}`));
+	const elapsed = elapsedText(task);
+	if (elapsed) parts.push(theme.fg("dim", `· ${elapsed}`));
+	return parts.join(" ");
+}
+
+/** 终态行：失败、超时与取消，附耗时。 */
+function statusLine(task: TaskProgress, theme: Theme, at: number): string {
+	const parts = [markGlyph(task, theme, at), ...terminalLabel(task, theme)];
+	const elapsed = elapsedText(task);
+	if (elapsed) parts.push(theme.fg("dim", `· ${elapsed}`));
+	return parts.join(" ");
+}
+
+/** 折叠态预览：前几行 + 展开提示。 */
+function previewLines(body: string, theme: Theme, width: number): string[] {
+	const lines = body.split("\n");
+	if (lines.length <= FALLBACK_LINES) {
+		return lines.map((line) => clipToWidth(theme.fg("toolOutput", line), width));
+	}
+	const hidden = lines.length - FALLBACK_LINES;
+	const preview = lines.slice(0, FALLBACK_LINES)
+		.map((line) => clipToWidth(theme.fg("toolOutput", line), width));
+	const hint = theme.fg("muted", `... 另有 ${hidden} 行 `) + keyHint("app.tools.expand", "展开完整回答");
+	preview.push(clipToWidth(hint, width));
+	return preview;
+}
 
 interface TaskListOptions {
 	tasks: TaskProgress[];
@@ -246,11 +325,7 @@ interface TaskListOptions {
 	theme: Theme;
 }
 
-/**
- * 结果视图：单项与多项走同一形态——执行中只给状态行，完成后折叠态追加展开提示，展开态追加任务明细与完整回答。
- *
- * 布局只取决于 tasks.length，不依赖并发上限或调度策略。
- */
+/** 旧会话多任务树：只服务历史记录里的多任务 details。 */
 class TaskListComponent implements Component {
 	constructor(private readonly options: TaskListOptions) {}
 
@@ -258,16 +333,16 @@ class TaskListComponent implements Component {
 		return buildLines(this.options, width);
 	}
 
-	/** Pi 每次无效化都会重建渲染组件，这里没有需要失效的缓存。 */
+	/** 没有需要失效的缓存（Pi 会重建组件）。 */
 	invalidate(): void {}
 }
 
 function buildLines(options: TaskListOptions, width: number): string[] {
 	const { tasks, text, expanded, isPartial, theme } = options;
 	const multi = tasks.length > 1;
-	// 明细只在完成后生效：执行期间按展开键也只给状态，进度文本不是回答，不该被当成结果铺开。
+	// 明细只在完成后生效：进度文本不是回答。
 	const detail = expanded && !isPartial;
-	// 一次渲染固定一帧，同一行里所有任务与工具用同一个动画相位。
+	// 一次渲染固定一帧，全部任务与工具同相位。
 	const at = Date.now();
 	const lines: string[] = [clipToWidth(summaryLine(tasks, isPartial, theme), width)];
 	for (let index = 0; index < tasks.length; index += 1) {
@@ -276,9 +351,9 @@ function buildLines(options: TaskListOptions, width: number): string[] {
 			task, theme, multi, detail, isPartial, at, index === tasks.length - 1,
 		).map((line) => clipToWidth(line, width)));
 	}
-	// 执行期间的 content 就是那行进度文本：树已经包含进度，不再重复追加纯文本。
+	// 执行期间 content 就是进度文本，不再重复追加。
 	if (isPartial) return lines;
-	// 截断提示已由任务节点用结构化形式给出（含完整结果路径），正文里不再重复一遍。
+	// 截断提示已由任务节点给出，正文不再重复。
 	const body = text.replace(TRUNCATION_NOTICE, "").trim();
 	const report = body.replace(REPORT_SUMMARY, "").trim();
 	if (detail) {
@@ -288,7 +363,7 @@ function buildLines(options: TaskListOptions, width: number): string[] {
 		}
 		return lines;
 	}
-	// 折叠态一律只给树与展开提示，正文预览只放在展开态。
+	// 折叠态只给树与展开提示。
 	if (body) lines.push(keyHint("app.tools.expand", "展开完整回答"));
 	return lines;
 }
@@ -308,6 +383,26 @@ function summaryLine(tasks: TaskProgress[], isPartial: boolean, theme: Theme): s
 	return parts.join(theme.fg("muted", " · "));
 }
 
+/** 进行中给动画圈，终态给标记。 */
+function markGlyph(task: TaskProgress, theme: Theme, at: number): string {
+	const terminal = TERMINAL_MARKS[task.state];
+	return terminal ? theme.fg(terminal.color, terminal.glyph) : activeMark(task.state, theme, at);
+}
+
+/** 终态说明：只有失败/超时/取消写原因。 */
+function terminalLabel(task: TaskProgress, theme: Theme): string[] {
+	const terminal = TERMINAL_MARKS[task.state];
+	if (!terminal?.label) return [];
+	return [theme.fg("muted", "·"), theme.fg(terminal.color, terminal.label)];
+}
+
+/** 工具计数；没有记录时退回最近工具名。 */
+function toolFacts(task: TaskProgress, theme: Theme): string[] {
+	const toolCount = (task.omittedTools ?? 0) + (task.tools?.length ?? 0);
+	if (toolCount > 0) return [theme.fg("muted", `· ${toolCount} 个工具`)];
+	return task.lastTool ? [theme.fg("muted", `· ${task.lastTool}`)] : [];
+}
+
 function taskLines(
 	task: TaskProgress,
 	theme: Theme,
@@ -319,14 +414,9 @@ function taskLines(
 ): string[] {
 	const terminal = TERMINAL_MARKS[task.state];
 	const connector = theme.fg("borderMuted", isLastTask ? "└─" : "├─");
-	const parts = [connector, terminal ? theme.fg(terminal.color, terminal.glyph) : activeMark(task.state, theme, at)];
 	const label = `${multi ? `#${task.index} ` : ""}${task.agent}`;
-	parts.push(theme.fg("toolTitle", label));
-	// 进行中不写状态词，只有终态需要说明原因（失败/已超时/已取消）。
-	if (terminal?.label) parts.push(theme.fg("muted", "·"), theme.fg(terminal.color, terminal.label));
-	const toolCount = (task.omittedTools ?? 0) + (task.tools?.length ?? 0);
-	if (toolCount > 0) parts.push(theme.fg("muted", `· ${toolCount} 个工具`));
-	else if (task.lastTool) parts.push(theme.fg("muted", `· ${task.lastTool}`));
+	const parts = [connector, markGlyph(task, theme, at), theme.fg("toolTitle", label), ...terminalLabel(task, theme)];
+	parts.push(...toolFacts(task, theme));
 	const elapsed = elapsedText(task);
 	if (elapsed) parts.push(theme.fg("dim", `· ${elapsed}`));
 	if (task.truncated && !detail) parts.push(theme.fg("warning", "· 结果已截断"));
@@ -363,14 +453,13 @@ function toolText(tool: ToolCallProgress, theme: Theme, at: number): string {
 /**
  * 按可见宽度截断并补省略号。
  *
- * 不能用 pi-tui 的 truncateToWidth：它在省略号两侧插全量重置（\x1b[0m），
- * 而 Pi 的工具卡片靠外层 Box 给整行铺底色，全量重置会把底色一起清掉，
- * 省略号及其右侧会回落成终端默认底色（前景色也会一起丢）。
+ * 不能用 pi-tui 的 truncateToWidth：它在省略号两侧插全量重置，会把 Pi 工具卡片
+ * 由外层 Box 铺的底色一起清掉（省略号及右侧回落成终端默认底色）。
  */
 function clipToWidth(text: string, maxWidth: number): string {
 	if (maxWidth <= 0) return "";
 	if (visibleWidth(text) <= maxWidth) return text;
-	// 极窄宽度下省略号自己也要裁，否则会返回 3 列、超出 maxWidth。
+	// 极窄宽度下省略号自己也要裁，否则会超宽。
 	if (maxWidth <= ELLIPSIS.length) return ELLIPSIS.slice(0, maxWidth);
 	return sliceByColumn(text, 0, maxWidth - ELLIPSIS.length, true) + ELLIPSIS;
 }

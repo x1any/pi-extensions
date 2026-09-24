@@ -23,7 +23,7 @@ import { resolveAgentExtensions, normalizeSource } from "./extensions.ts";
 const EXECUTION_TIMEOUT_MS = 10 * 60 * 1000;
 const ABORT_GRACE_MS = 5000;
 
-/** 父会话内只读子任务的并发上限：同一调用内的多项任务与模型连续发出的多次调用共用这一个池。 */
+/** 只读子任务并发上限：父会话内所有调用共用这一个池。 */
 export const MAX_CONCURRENCY = 3;
 
 type FailureKind = "cancelled" | "timeout" | "startup" | "authentication" | "model"
@@ -545,7 +545,7 @@ export class SubagentRunner {
 	}
 
 	/**
-	 * 写入完整输出并返回路径。文件名由调用方决定：单项结果 `result.md`，整次报告 `report.md`。
+	 * 写入完整输出并返回路径（文件名由调用方决定）。
 	 * 临时目录注册进 retainedDirs，由 shutdown 统一清理，因此取消、超时或父会话关闭都不会遗留文件。
 	 */
 	async retainFullText(text: string, fileName: string): Promise<string> {
