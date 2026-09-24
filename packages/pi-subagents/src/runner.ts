@@ -23,14 +23,6 @@ import { resolveAgentExtensions, normalizeSource } from "./extensions.ts";
 const EXECUTION_TIMEOUT_MS = 10 * 60 * 1000;
 const ABORT_GRACE_MS = 5000;
 
-/**
- * 默认在子会话里加载的扩展来源：Agent 不用在 frontmatter 里声明。
- * 只放随 pi 提供检索/只读能力的来源；来源缺失（未安装、未启用）时静默跳过，子会话退回 Pi 内置工具
- * （pi-fff 处于 `override` 模式时，它覆盖的就是内置名 `grep`/`find`，所以回退不需要换工具名）。
- * 加载失败（来源存在但自身报错）仍然报错，不静默降级。
- */
-const DEFAULT_CHILD_EXTENSIONS = ["npm:@ff-labs/pi-fff"];
-
 /** 父会话内只读子任务的并发上限：同一调用内的多项任务与模型连续发出的多次调用共用这一个池。 */
 export const MAX_CONCURRENCY = 3;
 
@@ -220,8 +212,8 @@ async function closeChildSession(session: AgentSession): Promise<void> {
  * 在父进程内创建一个独立的 Pi 会话。
  *
  * 与旧版 spawn 一个 `pi --mode json --print` 子进程等价：全新上下文、无持久会话、不自动发现扩展与技能，
- * 只按 Agent 配置启用工具白名单、默认加载 `npm:@ff-labs/pi-fff`（Agent 不用声明）、加载 Agent 声明
- * 或由父会话已加载工具推导的扩展（包来源含随包 skills），并追加角色正文作为系统提示。
+ * 只按 Agent 配置启用工具白名单、加载 Agent 声明或由父会话已加载工具推导的扩展（包来源含随包 skills），
+ * 不默认加载任何来源，并追加角色正文作为系统提示。
  * 来源不可用（未安装、未启用或路径不存在）时跳过该来源，子会话用已注册的工具继续；只有显式写进 tools 的
  * 名字缺失才拒绝启动。
  * 不复制父会话内存态的 provider、认证和扩展工具；这些仍由普通 Pi 配置在子运行时中解析。
@@ -249,17 +241,16 @@ async function createChildSession(request: RunRequest): Promise<{ session: Agent
 	}
 	let extensionPaths: string[] = [];
 	let skillPaths: string[] = [];
-	// 默认来源在前、声明来源在后，同一来源只解析一次（Agent 重复声明 pi-fff 也不会加载两次）。
+	// 同一来源只解析一次：忽略 `npm:` 前缀与版本号，Agent 重复声明也不会加载两次。
 	let unavailableSources: string[] = [];
 	try {
-		const resolution = await resolveAgentExtensions(mergeSources(request.agent.extensions), {
+		const resolution = await resolveAgentExtensions(dedupeSources(request.agent.extensions), {
 			cwd: request.cwd, agentDir, settingsManager,
 		});
 		extensionPaths = resolution.paths;
 		skillPaths = resolution.skillPaths;
-		// 默认来源缺失属于正常回退（改用内置 grep/find），不写进结果文本；其他来源缺失才提示。
-		const defaults = new Set(DEFAULT_CHILD_EXTENSIONS.map((source) => normalizeSource(source)));
-		unavailableSources = resolution.missing.filter((source) => !defaults.has(normalizeSource(source)));
+		// 来源不可用时跳过；缺的是显式声明的工具就拒绝启动，并在提示里点名来源。
+		unavailableSources = resolution.missing;
 	} catch (error) {
 		throw new SubagentError("startup", `无法解析子会话要加载的扩展：${errorText(error)}`);
 	}
@@ -268,7 +259,7 @@ async function createChildSession(request: RunRequest): Promise<{ session: Agent
 		agentDir,
 		settingsManager,
 		// 等价于旧版的 --no-extensions --no-skills --no-prompt-templates --no-themes：
-		// 不做环境发现，只加载默认来源与 Agent 声明的扩展；也不会在同一进程里再加载一份本扩展。
+		// 不做环境发现，只加载 Agent 声明或推导的扩展；也不会在同一进程里再加载一份本扩展。
 		// 来源随包提供的 skills 由 additionalSkillPaths 显式传入，不依赖全局发现。
 		noExtensions: true,
 		noSkills: true,
@@ -318,11 +309,11 @@ async function createChildSession(request: RunRequest): Promise<{ session: Agent
 	}
 }
 
-/** 默认来源在前、声明来源在后；同一来源（忽略 `npm:` 前缀与版本号）只保留第一次出现。 */
-function mergeSources(declared: string[]): string[] {
+/** 同一来源（忽略 `npm:` 前缀与版本号）只保留第一次出现；不加载任何未声明的来源。 */
+function dedupeSources(declared: string[]): string[] {
 	const merged: string[] = [];
 	const seen = new Set<string>();
-	for (const source of [...DEFAULT_CHILD_EXTENSIONS, ...declared]) {
+	for (const source of declared) {
 		const key = normalizeSource(source);
 		if (seen.has(key)) continue;
 		seen.add(key);
@@ -354,7 +345,7 @@ function checkDeclaredTools(request: RunRequest, session: AgentSession, unavaila
 	const hint = unavailableSources.length > 0
 		? `所需扩展来源不可用：[${unavailableSources.join(", ")}]（未安装、未启用或路径不存在）。`
 		: request.agent.extensions.length === 0
-			? "子会话仅默认加载 pi-fff；只有父会话已加载、且有可解析入口路径的扩展工具才能在省略 extensions 时推导来源，否则请显式声明来源。"
+			? "子会话没有可加载的扩展来源；只有父会话已加载、且有可解析入口路径的扩展工具才能在省略 extensions 时推导来源，否则请在 frontmatter 显式声明来源。"
 			: fromExtensions.length > 0
 				? `已加载扩展注册的工具：[${fromExtensions.join(", ")}]。`
 				: "所需扩展没有注册对应工具，请检查扩展自身的启用条件。";
@@ -492,8 +483,7 @@ async function runSession(request: RunRequest, signal: AbortSignal): Promise<{ t
 	if (!answer || answer.stopReason !== "stop" || answer.hasToolCalls || !answer.text.trim()) {
 		throw new SubagentError("no-answer", `子会话没有有效的最终文本回答（stopReason=${answer?.stopReason ?? "none"}）。\n${errors}`);
 	}
-	// 跳过来源的事实要进入模型可见文本：主 Agent 需要知道这次委派少了哪些扩展工具，
-	// 而不是以为子会话的检索仍走 pi-fff。
+	// 跳过来源的事实要进入模型可见文本：主 Agent 需要知道这次委派少了哪些扩展工具。
 	const notice = unavailableSources.length > 0
 		? `[已跳过不可用的扩展来源：${unavailableSources.join(", ")}（未安装、未启用或路径不存在），子会话用已注册的工具继续。]`
 		: "";

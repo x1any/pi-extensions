@@ -23,7 +23,7 @@ export interface AgentConfig {
 	requiredTools: string[];
 	/** 子会话额外加载的来源：显式声明，或从父会话已加载的工具推导。 */
 	extensions: string[];
-	/** 仅省略 extensions 时推导；显式 [] 表示只加载默认来源。 */
+	/** 仅省略 extensions 时推导；显式 [] 表示不加载任何来源。 */
 	inferExtensions: boolean;
 	model?: string;
 	thinking?: ThinkingLevel;
@@ -158,9 +158,5 @@ export function discoverAgents(cwd: string, projectTrusted: boolean): AgentDisco
 }
 
 export function configurationHint(cwd: string): string {
-	return [
-		`请在 ${join(getAgentDir(), "agents")} 或受信任项目的 ${join(cwd, CONFIG_DIR_NAME, "agents")} 中创建 Agent Markdown 文件，然后 /reload。`,
-		"必填 frontmatter 为 name、description；省略 tools 时只启用 read, grep, find, ls，扩展工具须逐名列出。扩展不会自动创建配置。",
-		"子会话默认加载 pi-fff（缺失时回退内置 grep/find）；省略 extensions 时可从父会话已加载工具推导来源，无法推导的来源须显式声明。不会自动安装或下载缺失的扩展。",
-	].join("");
+	return `请在 ${join(getAgentDir(), "agents")} 或受信任项目的 ${join(cwd, CONFIG_DIR_NAME, "agents")} 中创建 Agent Markdown 文件并 /reload。必填字段：name、description；默认 tools 为 read, grep, find, ls，扩展工具须逐名列出。省略 extensions 时根据已加载工具推导来源，不会自动安装扩展。`;
 }
