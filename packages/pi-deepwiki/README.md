@@ -4,13 +4,13 @@
 
 ## 安装
 
-在本仓库根目录执行：
+代码推送到 GitHub 后，使用单仓库 Git 来源安装：
 
 ```powershell
-pi install ./packages/pi-deepwiki
+pi install git:github.com/x1any/pi-extensions
 ```
 
-安装后在已有会话中执行 `/reload`，或重新启动 Pi。
+这个来源安装的是**整个仓库**，不是单独的 `pi-deepwiki`。请在 Pi 的 `packages` 资源过滤器中只启用所需扩展（至少 `packages/pi-deepwiki/index.ts`）；同时使用 Exa / 子 Agent 时参见 [pi-subagents 的 Git 安装说明](../pi-subagents/README.md#github-monorepo)。本地开发仍可在仓库根目录用 `pi install ./packages/pi-deepwiki`。安装后在已有会话中执行 `/reload`，或重新启动 Pi。
 
 ## 工具
 

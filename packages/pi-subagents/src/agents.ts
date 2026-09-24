@@ -14,26 +14,28 @@ const READ_ONLY_TOOLS = ["read", "grep", "find", "ls"];
 const BUILTIN_TOOLS = new Set([...READ_ONLY_TOOLS, "edit", "write", "powershell", "bash"]);
 
 /**
- * 已知只读的扩展来源：来源（忽略 `npm:` 前缀与版本号）→ 省略 `tools` 时自动启用的只读工具。
+ * 已知只读的扩展来源：来源 → 省略 `tools` 时自动启用的只读工具。
  * 只读的含义是不改动工作目录。
  *
- * - pi-web-access：`web_search`/`source_check`/`fetch_content`/`get_search_content`（默认工具名）。
+ * - git:github.com/x1any/pi-extensions：pi-exa 的 `web_search`/`web_fetch`，以及
+ *   pi-deepwiki 的 `deepwiki_read_wiki_structure`/`deepwiki_read_wiki_contents`/`deepwiki_ask_question`。
  * - context7（`@upstash/context7-pi`）：`resolve-library-id`/`query-docs`（默认工具名，只查询远端文档）。
  *
  * pi-fff 不登记在这里：它按全局 `pi-fff.json` 的 `override` 模式运行，检索工具名就是内置只读名
  * `grep`/`find`（同名覆盖内置实现）；只有 `PI_FFF_MULTIGREP=1` 时多出一个 `multi_grep`，需要时在
  * tools 里显式列出。
  *
- * pi-web-access 的写入都在扩展自己的状态目录与临时目录（web-search-cache、GitHub 克隆、PDF 产物），
- * 不在工作目录里，父会话用同一批工具时也在写；context7 只发远端查询，扩展内没有落盘代码。
- * 这里只按工具名判定，不检查扩展实现；这些扩展都允许在配置里改工具名，改过名的工具不在名单里，
- * 因此默认只能带上下列默认名字，改过名仍要显式列出。
- * 下列名字也未必都注册：pi-web-access 的每个工具都能按功能开关单独关闭，所以自动启用只能按
- * 「来源注册了同名工具才生效」处理。
+ * pi-exa 和 pi-deepwiki 只在输出截断时写系统临时目录，不改工作目录；context7 只发远端查询。
+ * 这里只按工具名判定，不检查扩展实现；自动启用仅适用于下列默认来源名，
+ * 本地路径等其他来源需要在 Agent 的 tools 中显式列出工具名。
+ * 来源未加载或没有注册同名工具时，自动启用的名字由子会话忽略。
  * 名单外的扩展工具无法静态判断是否写盘：既不会自动启用，也按未验证处理（独占调度）。
  */
 const TRUSTED_READ_ONLY_SOURCES: Record<string, string[]> = {
-	"pi-web-access": ["web_search", "source_check", "fetch_content", "get_search_content"],
+	"git:github.com/x1any/pi-extensions": [
+		"web_search", "web_fetch",
+		"deepwiki_read_wiki_structure", "deepwiki_read_wiki_contents", "deepwiki_ask_question",
+	],
 	"@upstash/context7-pi": ["resolve-library-id", "query-docs"],
 };
 const READ_ONLY_EXTENSION_TOOLS = [...new Set(Object.values(TRUSTED_READ_ONLY_SOURCES).flat())];
@@ -47,7 +49,7 @@ export interface AgentConfig {
 	tools: string[];
 	/**
 	 * 必须在子会话工具注册表中存在的名字：frontmatter 显式写出的工具，或是省略 tools 时的内置只读工具。
-	 * 省略 tools 时自动展开的扩展工具不在此列：来源没注册同名工具（功能开关关闭、改过名等）时只是不启用该名字，不拒绝启动。
+	 * 省略 tools 时自动展开的扩展工具不在此列：来源没注册同名工具时只是不启用该名字，不拒绝启动。
 	 */
 	requiredTools: string[];
 	/** 只在本 Agent 子会话中显式加载的扩展来源：本地路径或已安装的 npm/git 来源；来源随包提供的 skills 一并加载。 */
@@ -65,7 +67,7 @@ export function isBuiltinToolName(name: string): boolean {
 
 /**
  * 只读 Agent：工具白名单全部命中内置只读工具，或命中已知只读的扩展工具
- * （pi-web-access 搜索/抓取工具、context7 文档查询）。
+ * （pi-exa 搜索/抓取、pi-deepwiki 仓库文档、context7 文档查询）。
  *
  * 其余含 edit、write、powershell、bash 或名单外扩展工具名时无法静态判断是否写盘，一律视为未验证，
  * 由调度器按独占处理。判定只影响调度，不拒绝调用，因此现有 Agent 定义无需修改。

@@ -4,7 +4,25 @@
 
 ## 安装
 
-在仓库根目录执行 `pi install ./packages/pi-subagents`，完成后 `/reload` 生效。
+本地开发时在仓库根目录执行 `pi install ./packages/pi-subagents`，完成后 `/reload` 生效。
+
+<a id="github-monorepo"></a>
+
+### 从 GitHub 单仓库安装 Exa / DeepWiki
+
+代码推送到 GitHub 后执行 `pi install git:github.com/x1any/pi-extensions`。Pi 安装的是**整个仓库根包**，而非 `packages/pi-exa` 或 `packages/pi-deepwiki` 子目录；根包默认暴露仓库里的所有扩展。若 `pi-subagents` 已按上面的本地路径单独安装，可将用户级 `~/.pi/agent/settings.json` 中该 Git 来源的配置改为（保留其他已有包条目）：
+
+```json
+{
+  "source": "git:github.com/x1any/pi-extensions",
+  "extensions": [
+    "packages/pi-exa/index.ts",
+    "packages/pi-deepwiki/index.ts"
+  ]
+}
+```
+
+这是 `packages` 数组中的**一个条目**，只启用两个 Git 扩展；若 `pi-subagents` 也只从该 Git 仓库安装，则在此列表额外加入 `"packages/pi-subagents/index.ts"`，不要再安装一份本地副本。迁移到 Git 来源时请停用提供同名工具的旧来源（包括 pi-web-access 和本地 pi-deepwiki），避免父会话重复注册。修改后 `/reload`，可用 `pi list` 核对包来源。子 Agent 的 Git 来源必须已安装、已启用，委派时不会临时下载。
 
 ## Agent 配置
 
@@ -28,11 +46,13 @@ tools: read, grep, find, ls
 | `name` | 必填，调用时使用准确名称 |
 | `description` | 必填，列入工具描述 |
 | `tools` | 工具白名单，逗号分隔字符串或 YAML 列表；省略为 `read, grep, find, ls` 加已声明可信只读来源的只读工具，`[]` 禁用全部。内置为 `read`/`grep`/`find`/`ls`/`edit`/`write`/`powershell`/`bash`，其余视为扩展工具；显式写出的名字必须真实注册，缺一个就拒绝启动，自动启用的名字缺失时忽略 |
-| `extensions` | 可选，在默认来源之外额外加载的扩展来源（本地路径或已安装来源，如 `npm:pi-web-access`）；省略或 `[]` 表示只加载默认来源。不会安装或下载任何东西；来源随包提供的 skills 会一并加载。来源不可用（未安装、未启用或路径不存在）时跳过该来源，子会话用已注册的工具继续；声明的来源被跳过时会在结果文本里注明 |
+| `extensions` | 可选，在默认来源之外额外加载的扩展来源（本地路径或已安装来源，如 `git:github.com/x1any/pi-extensions`）；省略或 `[]` 表示只加载默认来源。不会安装或下载任何东西；来源随包提供的 skills 会一并加载。来源不可用（未安装、未启用或路径不存在）时跳过该来源，子会话用已注册的工具继续；声明的来源被跳过时会在结果文本里注明 |
 | `model` | 可选，完整 `provider/model`，默认继承父会话当前模型 |
 | `thinking` | 可选，`off/minimal/low/medium/high/xhigh/max`，默认继承父会话 |
 
 子会话默认加载 `npm:@ff-labs/pi-fff`，不需要在 Agent 里声明：装了就由 FFF 提供 `grep`/`find`（pi-fff 处于 `override` 模式时同名覆盖内置实现，模式来自全局 `pi-fff.json`），没装或未启用就静默跳过、回退 Pi 内置 `grep`/`find`；默认来源缺失不写进结果文本，声明的来源缺失才提示。默认来源只放检索/只读能力，加载失败（来源存在但自身报错）仍然报错。
+
+联网调查参考 [`examples/researcher.md`](examples/researcher.md)，公共 GitHub 仓库的 DeepWiki 问答参考 [`examples/deepwiki.md`](examples/deepwiki.md)。两者都声明同一个已安装的 Git 仓库来源：子会话会加载该来源中**全部已启用**的扩展，但 Agent 的 `tools` 白名单分别只允许调用自己的工具。示例显式要求工具存在：来源缺失或过滤掉所需工具时会拒绝启动。子会话结束时会通知扩展清理 MCP 连接与临时文件。推送并完成 Git 安装前，现有用户级 Agent 的本地包路径仍可使用；确认安装后把对应定义的 `extensions` 改为 `git:github.com/x1any/pi-extensions`，再 `/reload`。
 
 仅支持以上字段。Markdown 正文以追加系统提示注入，不替换系统提示词，也不读取父会话的追加提示词或 `APPEND_SYSTEM.md`。
 

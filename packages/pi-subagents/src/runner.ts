@@ -207,6 +207,15 @@ interface FinalAnswer {
 	hasToolCalls: boolean;
 }
 
+/** dispose() 不广播 session_shutdown；先通知子会话扩展清理 MCP 连接和临时文件。 */
+async function closeChildSession(session: AgentSession): Promise<void> {
+	try {
+		await session.extensionRunner.emit({ type: "session_shutdown", reason: "quit" });
+	} finally {
+		session.dispose();
+	}
+}
+
 /**
  * 在父进程内创建一个独立的 Pi 会话。
  *
@@ -299,9 +308,14 @@ async function createChildSession(request: RunRequest): Promise<{ session: Agent
 		throw new SubagentError("startup", `创建子会话失败：${errorText(error)}`);
 	}
 	// print 模式：没有交互式 UI，已加载的扩展只能走无界面路径。
-	await session.bindExtensions({ mode: "print" });
-	checkDeclaredTools(request, session, unavailableSources);
-	return { session, unavailableSources };
+	try {
+		await session.bindExtensions({ mode: "print" });
+		checkDeclaredTools(request, session, unavailableSources);
+		return { session, unavailableSources };
+	} catch (error) {
+		await closeChildSession(session);
+		throw error;
+	}
 }
 
 /** 默认来源在前、声明来源在后；同一来源（忽略 `npm:` 前缀与版本号）只保留第一次出现。 */
@@ -459,9 +473,8 @@ async function runSession(request: RunRequest, signal: AbortSignal): Promise<{ t
 		if (armGrace) signal.removeEventListener("abort", armGrace);
 		signal.removeEventListener("abort", abortSession);
 		unsubscribe();
-		// 没有扩展加载，无需广播 session_shutdown；dispose 只释放监听器和 agent 连接。
 		if (abandoned) await session.abort().catch(() => {});
-		session.dispose();
+		await closeChildSession(session);
 	}
 
 	if (failure) throw failure;

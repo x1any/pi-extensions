@@ -1,0 +1,29 @@
+{
+  "name": "pi-exa",
+  "version": "0.1.0",
+  "description": "Lightweight Pi web search and fetch tools backed by the hosted Exa MCP server",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "exa",
+    "mcp",
+    "web-search"
+  ],
+  "files": [
+    "index.ts",
+    "src",
+    "README.md"
+  ],
+  "pi": {
+    "extensions": [
+      "./index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}
