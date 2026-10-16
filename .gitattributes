@@ -1,0 +1,7 @@
+# 行尾策略写进仓库：文本统一以 LF 入库、以 LF 检出，不再依赖各机 core.autocrlf。
+* text=auto eol=lf
+
+# Windows 脚本保留 CRLF：cmd.exe 对 LF 的 .bat/.cmd 容错差。
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
