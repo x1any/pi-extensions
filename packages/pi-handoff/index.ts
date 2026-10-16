@@ -1,1 +1,1 @@
-export { default } from "./src/handoff.ts";
+export { default } from "./src/command.ts";

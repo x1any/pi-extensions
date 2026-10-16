@@ -10,6 +10,8 @@
  * and a compact provenance card (a custom entry outside LLM context).
  */
 
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { type UserMessage, uuidv7 } from "@earendil-works/pi-ai";
 import {
 	BorderedLoader,
@@ -17,18 +19,24 @@ import {
 	convertToLlm,
 	type ExtensionAPI,
 	ExtensionEditorComponent,
+	getAgentDir,
 	serializeConversation,
 } from "@earendil-works/pi-coding-agent";
 import { getKeybindings } from "@earendil-works/pi-tui";
 
 import {
 	buildHandoffRecord,
-	deriveSessionName,
 	HANDOFF_ENTRY_TYPE,
 	type HandoffRecordData,
 	readHandoffChain,
 	renderHandoffCard,
-} from "./handoff-record.ts";
+} from "./record.ts";
+import { deliverHandoff } from "./delivery.ts";
+import { registerHandoffInitialization } from "./init.ts";
+import { parseHandoffArgs } from "./options.ts";
+import { HandoffStore } from "./bundle.ts";
+import { openHandoffSession } from "./session.ts";
+import { HerdrClient, herdrEnvironment } from "./herdr.ts";
 
 const SYSTEM_PROMPT = `你是一名上下文交接助手。请根据对话历史和用户的新会话目标，生成一份聚焦任务的提示词，满足以下要求：
 
@@ -77,6 +85,7 @@ type HandoffOperation = {
 
 export default function handoffExtension(pi: ExtensionAPI) {
 	let activeOperation: HandoffOperation | undefined;
+	registerHandoffInitialization(pi);
 
 	// Provenance cards stay out of LLM context; they only render in the TUI.
 	pi.registerEntryRenderer<HandoffRecordData>(HANDOFF_ENTRY_TYPE, renderHandoffCard);
@@ -94,7 +103,7 @@ export default function handoffExtension(pi: ExtensionAPI) {
 	});
 
 	pi.registerCommand("handoff", {
-		description: "Transfer context to a new focused session",
+		description: "Hand off a reviewed draft to a new herdr tab (--split right|down, --here)",
 		handler: async (args, ctx) => {
 			if (ctx.mode !== "tui") {
 				const message = "handoff requires interactive mode";
@@ -114,11 +123,16 @@ export default function handoffExtension(pi: ExtensionAPI) {
 				return;
 			}
 
-			const goal = args.trim();
-			if (!goal) {
-				ctx.ui.notify("Usage: /handoff <goal for new thread>", "error");
+			let parsed: ReturnType<typeof parseHandoffArgs>;
+			let herdr: HerdrClient | undefined;
+			try {
+				parsed = parseHandoffArgs(args);
+				if (parsed.destination !== "here") herdr = new HerdrClient(herdrEnvironment());
+			} catch (error) {
+				ctx.ui.notify(error instanceof Error ? error.message : String(error), "error");
 				return;
 			}
+			const { goal, destination } = parsed;
 
 			// Acquire before the first await; Pi can invoke commands concurrently while busy.
 			const operation: HandoffOperation = { controller: new AbortController(), allowReplacement: false };
@@ -247,7 +261,7 @@ export default function handoffExtension(pi: ExtensionAPI) {
 					operation.cancelUI = cancelUI;
 					const editor = new ExtensionEditorComponent(
 						tui, kb,
-						"Review handoff draft (confirm opens a new session; does not send)",
+						`Review handoff draft (confirm: ${destination === "here" ? "same pane" : destination === "tab" ? "new herdr tab" : `split ${destination}`}; does not send)`,
 						result.prompt, finish, cancelUI,
 						{ description: "External editor is disabled here to protect pasted text (Pi 1.2.0)." },
 					);
@@ -306,31 +320,40 @@ export default function handoffExtension(pi: ExtensionAPI) {
 					},
 					inheritedChain: readHandoffChain(ctx.sessionManager.getBranch()),
 				});
-				const sessionName = deriveSessionName(goal);
+				const data = { prompt: editedPrompt, goal, record };
+				const previousDraft = ctx.ui.getEditorText();
+				// Keep a local copy before any external side effect. On failure it stays
+				// here; on success restore the old draft only if the user did not edit it.
+				ctx.ui.setEditorText(editedPrompt);
+				if (destination !== "here") {
+					ctx.ui.setStatus("pi-handoff", "Opening handoff in herdr…");
+					try {
+						const target = await deliverHandoff({
+							payload: { ...data, cwd: ctx.cwd, configuration: "target-defaults" },
+							destination,
+							store: new HandoffStore(join(getAgentDir(), "handoffs")),
+							herdr: herdr!,
+							extension: fileURLToPath(new URL("../index.ts", import.meta.url)),
+							signal: operation.controller.signal,
+							hasDraftBackup: () => isValid() && ctx.ui.getEditorText() === editedPrompt,
+						});
+						if (!isValid()) return;
+						if (ctx.ui.getEditorText() === editedPrompt) ctx.ui.setEditorText(previousDraft);
+						ctx.ui.notify(`Handoff draft ready in ${target.paneId}. Nothing sent; source session unchanged.`, "info");
+					} finally {
+						if (isValid()) ctx.ui.setStatus("pi-handoff", undefined);
+					}
+					return;
+				}
 
-				// Our own newSession also shuts down the old context. Only its fresh
-				// withSession callback may populate the draft after that boundary.
-				operation.allowReplacement = true;
-				let targetSessionId: string | undefined;
-				const newSessionResult = await ctx.newSession({
-					parentSession: currentSessionFile,
-					// setup runs only after the switch is committed, so a cancelled
-					// switch never leaves a name or a record behind. Both entries stay in
-					// memory until the first user or assistant message creates the file.
-					setup: async (sessionManager) => {
-						targetSessionId = sessionManager.getSessionId();
-						sessionManager.appendSessionInfo(sessionName);
-						sessionManager.appendCustomEntry(HANDOFF_ENTRY_TYPE, record);
-					},
-					withSession: async (replacementCtx) => {
-						if (!operation.allowReplacement || replacementCtx.sessionManager.getSessionId() !== targetSessionId) return;
-						replacementCtx.ui.setEditorText(editedPrompt);
-						replacementCtx.ui.notify("New session opened with the handoff draft. Nothing sent; submit when ready.", "info");
-					},
+				// Only an explicit --here replaces the source session. Use a fresh
+				// withSession context after the old runtime has shut down.
+				const newSessionResult = await openHandoffSession(ctx, data, {
+					beforeSwitch: () => { operation.allowReplacement = true; },
+					canPopulate: () => operation.allowReplacement,
 				});
-
 				if (isValid() && newSessionResult.cancelled) {
-					ctx.ui.notify("Handoff session switch cancelled. Staying in the current session.", "info");
+					ctx.ui.notify("Handoff session switch cancelled. Reviewed draft retained in the current editor.", "info");
 				}
 			} catch (error: unknown) {
 				// Before replacement we can report via the original UI. After shutdown

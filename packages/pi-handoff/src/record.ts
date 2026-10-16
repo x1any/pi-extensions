@@ -3,7 +3,7 @@
  *
  * The /handoff command stores one small record per new session as a custom
  * entry (never part of LLM context) and renders it through an entry renderer.
- * Kept separate from handoff.ts so the naming, chain, and card rules can be
+ * Kept separate from command.ts so the naming, chain, and card rules can be
  * verified without running the command.
  */
 
