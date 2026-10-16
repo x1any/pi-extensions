@@ -50,9 +50,9 @@ const FOCUS_PREFIX_WIDTH = 2;
 const CHECKED_MARKER = "[x] ";
 const UNCHECKED_MARKER = "[ ] ";
 
-/** Height cap for a bottom panel, leaving room for Pi's surrounding UI. */
+/** Height cap for an inline bottom panel, leaving room for Pi's surrounding UI. */
 const PANEL_MAX_HEIGHT_PERCENT = 92;
-/** Rows reserved below the panel for Pi's editor/footer. */
+/** Rows reserved outside the panel for Pi's footer and surrounding UI. */
 const PANEL_RESERVED_ROWS = 2;
 
 /** Maximum panel rows within the terminal height minus the reserved rows. */
@@ -236,7 +236,7 @@ type BottomSegment =
  * outer rules, a shared indentation grid, accent only on the focused row, a
  * selectedBg highlight for the row the cursor is on, and a bounded viewport
  * that keeps the focused row, the pinned action row, the hint, and the inline
- * editor visible instead of relying on overlay height truncation.
+ * editor visible within the panel's height budget.
  */
 function renderFrame(
     theme: Theme,
@@ -411,7 +411,7 @@ function renderFrame(
         ...bottomLines,
         ...new DynamicBorder(borderColor).render(renderWidth),
     ];
-    // Never render past the overlay height: keep the bottom rows (hint,
+    // Never render past the panel height: keep the bottom rows (hint,
     // editor, pinned action rows) and clip from the top instead.
     if (lines.length > maxHeight) {
         return lines.slice(lines.length - maxHeight);
@@ -577,15 +577,6 @@ export async function askSingleChoice(
                 },
                 handleInput,
             };
-        },
-        {
-            overlay: true,
-            overlayOptions: {
-                anchor: "bottom-center",
-                width: "100%",
-                // Keep Pi's bottom rows visible below the panel.
-                margin: { bottom: PANEL_RESERVED_ROWS },
-            },
         },
     );
 }
@@ -823,15 +814,6 @@ export async function askMultiChoice(
                 },
                 handleInput,
             };
-        },
-        {
-            overlay: true,
-            overlayOptions: {
-                anchor: "bottom-center",
-                width: "100%",
-                // Keep Pi's bottom rows visible below the panel.
-                margin: { bottom: PANEL_RESERVED_ROWS },
-            },
         },
     );
 }
